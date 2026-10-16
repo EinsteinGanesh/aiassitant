@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Local recordings, generated audio, and conversation history
+*.wav
+*.mp3
+*.db
+*.sqlite
+*.sqlite3

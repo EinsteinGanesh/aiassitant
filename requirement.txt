@@ -1,0 +1,7 @@
+websockets
+numpy
+yt-dlp
+pydub
+openwakeword
+google-genai
+libsql-experimental
