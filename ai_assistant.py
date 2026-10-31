@@ -156,68 +156,78 @@ def check_button():
     return cmd
 
 def download_youtube_song(query):
-    print(f"\n[MUSIC] Searching YouTube: {query}")
+    print(f"\n[MUSIC] Searching Full Song: {query}")
     for old in glob.glob("current_song.*"):
         try: os.remove(old)
         except: pass
 
-    # முயற்சி 1: YouTube (TV & iOS Client + Deno வழியாக)
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": "current_song.%(ext)s",
-        "default_search": "ytsearch1",
-        "quiet": True,
-        "noprogress": True,
-        "noplaylist": True,
-        "nocheckcertificate": True,
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "wav",
-        }],
-        "postprocessor_args": ['-ar', '16000', '-ac', '1'],
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["ios", "tv", "web_embedded"]
-            }
-        }
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"{query} tamil song audio", download=True)
-            title = info['entries'][0].get('title', query) if 'entries' in info and info['entries'] else info.get('title', query)
-        if os.path.exists("current_song.wav"):
-            print(f"✅ Downloaded from YouTube: {title}")
-            return "current_song.wav", title
-    except Exception as e:
-        print(f"⚠️ YouTube Blocked on Cloud IP ({e}). Switching to JioSaavn Full Song Backup...")
-
-    # முயற்சி 2: JioSaavn (யூடியூப் பிளாக் செய்தால் முழுப் பாட்டை எடுக்க)
-    try:
-        resp = requests.get(f"https://saavn.dev/api/search/songs?query={query}", timeout=10).json()
-        if resp.get("data") and resp["data"].get("results"):
-            song_data = resp["data"]["results"][0]
-            title = song_data.get("name", query)
-            # 160kbps அல்லது 320kbps முழு ஆடியோ லிங்க்
-            dl_url = song_data["downloadUrl"][-1]["url"]
-            
-            saavn_opts = {
-                "format": "bestaudio/best",
-                "outtmpl": "current_song.%(ext)s",
-                "quiet": True,
-                "noprogress": True,
-                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
-                "postprocessor_args": ['-ar', '16000', '-ac', '1']
-            }
-            with yt_dlp.YoutubeDL(saavn_opts) as ydl:
-                ydl.download([dl_url])
+    # --- முறை 1: JioSaavn API (320kbps முழு நீள ஒரிஜினல் தமிழ் பாடல்கள் - No Bot Block!) ---
+    saavn_apis = [
+        f"https://saavn.dev/api/search/songs?query={query}",
+        f"https://jiosaavn-api-privatecvc2.vercel.app/search/songs?query={query}"
+    ]
+    
+    for api_url in saavn_apis:
+        try:
+            resp = requests.get(api_url, timeout=8).json()
+            results = resp.get("data", {}).get("results") or resp.get("results")
+            if results and len(results) > 0:
+                song = results[0]
+                title = song.get("name") or song.get("title") or query
                 
-            if os.path.exists("current_song.wav"):
-                print(f"✅ Downloaded Full Song from JioSaavn: {title}")
-                return "current_song.wav", title
-    except Exception as e2:
-        print(f"❌ Music Error: {e2}")
+                # டவுன்லோட் லிங்க்கை எடுத்தல்
+                dl_links = song.get("downloadUrl") or song.get("more_info", {}).get("encrypted_media_url")
+                if isinstance(dl_links, list) and len(dl_links) > 0:
+                    stream_url = dl_links[-1].get("url") or dl_links[-1].get("link")
+                    
+                    print(f"⬇️ Downloading Full Song: {title}")
+                    # FFmpeg மூலம் நேரடியாக 16kHz Mono WAV ஆக மாற்றுதல் (2 விநாடிகளில் முடிந்துவிடும்)
+                    cmd = [
+                        "ffmpeg", "-y", "-i", stream_url,
+                        "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le",
+                        "current_song.wav"
+                    ]
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+                    
+                    if os.path.exists("current_song.wav") and os.path.getsize("current_song.wav") > 10000:
+                        print(f"✅ Ready to play: {title}")
+                        return "current_song.wav", title
+        except Exception as e:
+            print(f"⚠️ Saavn API trying next... ({e})")
 
+    # --- முறை 2: YouTube via Piped Proxy (யூடியூப்பில் மட்டுமே உள்ள ஆடியோக்களுக்கு) ---
+    print("🔄 Trying YouTube Proxy API...")
+    piped_apis = [
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.tokhmi.xyz",
+        "https://api.piped.projectsegfau.lt"
+    ]
+    for base_api in piped_apis:
+        try:
+            s_resp = requests.get(f"{base_api}/search?q={query}+song+audio&filter=music_songs", timeout=8).json()
+            items = s_resp.get("items", [])
+            if items:
+                vid_url = items[0].get("url", "") # e.g., /watch?v=szvt1vD0Uug
+                vid_id = vid_url.split("v=")[-1]
+                title = items[0].get("title", query)
+                
+                st_resp = requests.get(f"{base_api}/streams/{vid_id}", timeout=8).json()
+                audio_streams = st_resp.get("audioStreams", [])
+                if audio_streams:
+                    stream_url = audio_streams[0].get("url")
+                    cmd = [
+                        "ffmpeg", "-y", "-i", stream_url,
+                        "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le",
+                        "current_song.wav"
+                    ]
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=40)
+                    if os.path.exists("current_song.wav") and os.path.getsize("current_song.wav") > 10000:
+                        print(f"✅ Ready from YouTube Proxy: {title}")
+                        return "current_song.wav", title
+        except Exception as e:
+            continue
+
+    print("❌ Could not download the song from any source.")
     return None, None
 
 # --- 5. Audio Streaming Tasks ---
