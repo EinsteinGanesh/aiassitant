@@ -26,6 +26,9 @@ print("[SYSTEM] Loading offline 'Hey Jarvis' model...")
 openwakeword.utils.download_models(["hey_jarvis"])
 oww_model = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
 
+# ஆரம்ப வால்யூம் 20% (0.0 முதல் 1.0 வரை)
+current_volume = 0.2
+
 # WebSocket-ன் சாதாரண HTTP எரர்களை லாக்ஸில் காட்டாமல் மறைக்க
 logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
 
@@ -45,6 +48,15 @@ tx_queue = asyncio.Queue()
 mic_queue = asyncio.Queue()     
 button_queue = asyncio.Queue()  
 ai_audio_queue = asyncio.Queue()
+
+#volume increasing
+
+def apply_volume(audio_bytes, volume_level):
+    # 16-bit PCM ஆடியோவை numpy array-ஆக மாற்றுதல்
+    audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
+    # வால்யூமோடு பெருக்குதல் (0.2)
+    audio_scaled = (audio_np * volume_level).astype(np.int16)
+    return audio_scaled.tobytes()
 
 # --- 3. Persistent SQLite Memory Database ---
 DB_FILE = "jarvis_memory.db"
