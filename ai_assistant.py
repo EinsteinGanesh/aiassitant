@@ -13,6 +13,7 @@ from google import genai
 from google.genai import types
 import logging
 import requests
+import subprocess
 
 # --- 1. Gemini Configuration ---
 API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -157,78 +158,73 @@ def check_button():
 
 def download_youtube_song(query):
     print(f"\n[MUSIC] Searching Full Song: {query}")
-    for old in glob.glob("current_song.*"):
+    for old in glob.glob("current_song.*") + glob.glob("temp_audio.*"):
         try: os.remove(old)
         except: pass
 
-    # --- முறை 1: JioSaavn API (320kbps முழு நீள ஒரிஜினல் தமிழ் பாடல்கள் - No Bot Block!) ---
+    # பல JioSaavn API சர்வர்கள் (ஒன்று பிஸியாக இருந்தால் மற்றொன்று உடனே வேலை செய்யும்)
     saavn_apis = [
         f"https://saavn.dev/api/search/songs?query={query}",
-        f"https://jiosaavn-api-privatecvc2.vercel.app/search/songs?query={query}"
+        f"https://jiosaavn-api-privatecvc2.vercel.app/search/songs?query={query}",
+        f"https://saavn.me/search/songs?query={query}"
     ]
-    
+
+    stream_url = None
+    title = query
+
     for api_url in saavn_apis:
         try:
-            resp = requests.get(api_url, timeout=8).json()
-            results = resp.get("data", {}).get("results") or resp.get("results")
-            if results and len(results) > 0:
+            print(f"🔍 Trying API: {api_url.split('/')[2]}...")
+            resp = requests.get(api_url, timeout=6).json()
+            
+            # API வடிவத்திற்கு ஏற்ப Results எடுத்தல்
+            results = resp.get("data", {}).get("results") or resp.get("results") or resp.get("data")
+            if isinstance(results, list) and len(results) > 0:
                 song = results[0]
                 title = song.get("name") or song.get("title") or query
+                dl_links = song.get("downloadUrl")
                 
-                # டவுன்லோட் லிங்க்கை எடுத்தல்
-                dl_links = song.get("downloadUrl") or song.get("more_info", {}).get("encrypted_media_url")
                 if isinstance(dl_links, list) and len(dl_links) > 0:
+                    # 160kbps அல்லது 320kbps லிங்க் எடுத்தல்
                     stream_url = dl_links[-1].get("url") or dl_links[-1].get("link")
-                    
-                    print(f"⬇️ Downloading Full Song: {title}")
-                    # FFmpeg மூலம் நேரடியாக 16kHz Mono WAV ஆக மாற்றுதல் (2 விநாடிகளில் முடிந்துவிடும்)
-                    cmd = [
-                        "ffmpeg", "-y", "-i", stream_url,
-                        "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le",
-                        "current_song.wav"
-                    ]
-                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-                    
-                    if os.path.exists("current_song.wav") and os.path.getsize("current_song.wav") > 10000:
-                        print(f"✅ Ready to play: {title}")
-                        return "current_song.wav", title
+                    if stream_url:
+                        break
         except Exception as e:
-            print(f"⚠️ Saavn API trying next... ({e})")
+            print(f"⚠️ API Skip: {e}")
 
-    # --- முறை 2: YouTube via Piped Proxy (யூடியூப்பில் மட்டுமே உள்ள ஆடியோக்களுக்கு) ---
-    print("🔄 Trying YouTube Proxy API...")
-    piped_apis = [
-        "https://pipedapi.kavin.rocks",
-        "https://pipedapi.tokhmi.xyz",
-        "https://api.piped.projectsegfau.lt"
-    ]
-    for base_api in piped_apis:
-        try:
-            s_resp = requests.get(f"{base_api}/search?q={query}+song+audio&filter=music_songs", timeout=8).json()
-            items = s_resp.get("items", [])
-            if items:
-                vid_url = items[0].get("url", "") # e.g., /watch?v=szvt1vD0Uug
-                vid_id = vid_url.split("v=")[-1]
-                title = items[0].get("title", query)
-                
-                st_resp = requests.get(f"{base_api}/streams/{vid_id}", timeout=8).json()
-                audio_streams = st_resp.get("audioStreams", [])
-                if audio_streams:
-                    stream_url = audio_streams[0].get("url")
-                    cmd = [
-                        "ffmpeg", "-y", "-i", stream_url,
-                        "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le",
-                        "current_song.wav"
-                    ]
-                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=40)
-                    if os.path.exists("current_song.wav") and os.path.getsize("current_song.wav") > 10000:
-                        print(f"✅ Ready from YouTube Proxy: {title}")
-                        return "current_song.wav", title
-        except Exception as e:
-            continue
+    if not stream_url:
+        print("❌ Song not found in APIs!")
+        return None, None
 
-    print("❌ Could not download the song from any source.")
-    return None, None
+    try:
+        print(f"⬇️ Downloading Audio File: {title}")
+        # 1. முதலில் ஆடியோ ஃபைலை நேரடியாக டவுன்லோட் செய்தல் (Stuck ஆகாமல் இருக்க)
+        audio_data = requests.get(stream_url, timeout=15).content
+        with open("temp_audio.m4a", "wb") as f:
+            f.write(audio_data)
+
+        print("🔄 Converting to ESP32 WAV format (16kHz Mono)...")
+        # 2. டவுன்லோட் ஆன ஃபைலை சுத்தமான 16kHz WAV ஆக மாற்றுதல் (-fflags +bitexact மூலம் wave.open எரர் தடுக்கப்படும்)
+        cmd = [
+            "ffmpeg", "-y", "-i", "temp_audio.m4a",
+            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            "-fflags", "+bitexact", "current_song.wav"
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+
+        if os.path.exists("temp_audio.m4a"):
+            os.remove("temp_audio.m4a")
+
+        if os.path.exists("current_song.wav") and os.path.getsize("current_song.wav") > 10000:
+            print(f"✅ Successfully Ready: {title} ({os.path.getsize('current_song.wav')} bytes)")
+            return "current_song.wav", title
+        else:
+            print("❌ Conversion failed or empty file!")
+            return None, None
+
+    except Exception as e:
+        print(f"❌ Download/Convert Error: {e}")
+        return None, None
 
 # --- 5. Audio Streaming Tasks ---
 async def stream_music_task():
