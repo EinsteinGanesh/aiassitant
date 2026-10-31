@@ -161,13 +161,13 @@ def download_youtube_song(query):
         try: os.remove(old)
         except: pass
 
-    search_query = f"ytmsearch1:{query}"
+   search_query = f"{query} audio"
     
     # pydub இல்லாமல் நேரடியாக 16kHz Mono Wav ஆக டவுன்லோட் செய்யும் செட்டிங்ஸ்
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": "current_song.%(ext)s", 
-        'default_search': 'ytmsearch',
+        "default_search": "ytsearch1"
         "quiet": False, 
         "noplaylist": True, 
         "nocheckcertificate": True,
@@ -179,7 +179,7 @@ def download_youtube_song(query):
             '-ar', '16000', # 16kHz ESP32 Rate
             '-ac', '1'      # Mono Audio
         ],
-        'extractor_args': {'youtube': {'player_client': ['web_remix']}}
+        "extractor_args": {'youtube': {'player_client': ['web_remix']}}
     }
 
     try:
