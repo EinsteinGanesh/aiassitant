@@ -155,18 +155,17 @@ def check_button():
     return cmd
 
 def download_youtube_song(query):
-    print(f"\n[YOUTUBE] Searching: {query}")
+    print(f"\n[MUSIC] Searching: {query}")
     for old in glob.glob("current_song.*"):
         try: os.remove(old)
         except: pass
 
-    # 'ytmsearch1:' என்பதை நீக்கிவிட்டு நேரடியாகப் பாட்டின் பெயரை மட்டும் தேடுதல்
-    search_query = f"{query} audio"
+    # யூடியூப் Bot பிளாக்கைத் தவிர்க்க SoundCloud சர்ச் (scsearch1) பயன்படுத்துதல்
+    search_query = f"scsearch1:{query}"
     
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": "current_song.%(ext)s", 
-        "default_search": "ytsearch1",  # செட்டிங்ஸ் வழியாகவே 1st ரிசல்ட்டை எடுக்கச் சொல்வது
         "quiet": False, 
         "noplaylist": True, 
         "nocheckcertificate": True,
@@ -175,23 +174,25 @@ def download_youtube_song(query):
             "preferredcodec": "wav", 
         }],
         "postprocessor_args": [
-            '-ar', '16000', # 16kHz ரேட்
-            '-ac', '1'      # Mono ஆடியோ
-        ],
-       "extractor_args": {'youtube': {'player_client': ['android', 'ios']}} # யூடியூப் Bot எரரைத் தவிர்க்க
+            '-ar', '16000', # 16kHz ESP32 Rate
+            '-ac', '1'      # Mono Audio
+        ]
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(search_query, download=True)
-            title = info['entries'][0].get('title', query) if 'entries' in info and info['entries'] else info.get('title', query)
+            if 'entries' in info and len(info['entries']) > 0:
+                title = info['entries'][0].get('title', query)
+            else:
+                title = info.get('title', query)
                 
         if os.path.exists("current_song.wav"):
             return "current_song.wav", title
         else:
             return None, None
     except Exception as e:
-        print(f"❌ YouTube Error: {e}")
+        print(f"❌ Music Download Error: {e}")
         return None, None
 
 # --- 5. Audio Streaming Tasks ---
