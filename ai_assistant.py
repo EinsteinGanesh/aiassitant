@@ -18,7 +18,7 @@ API_KEY = os.environ.get("GEMINI_API_KEY")
 if not API_KEY:
     raise RuntimeError("Set the GEMINI_API_KEY environment variable before running the assistant.")
 client = genai.Client(api_key=API_KEY)
-LIVE_MODEL = "gemini-2.0-flash-exp" # அதிவேக ரெஸ்பான்ஸிற்காக 2.0 Flash பயன்படுத்தப்பட்டுள்ளது
+LIVE_MODEL = "gemini-3.8-live" # அதிவேக ரெஸ்பான்ஸிற்காக 2.0 Flash பயன்படுத்தப்பட்டுள்ளது
 
 print("[SYSTEM] Loading offline 'Hey Jarvis' model...")
 openwakeword.utils.download_models(["hey_jarvis"])
