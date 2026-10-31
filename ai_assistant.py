@@ -172,8 +172,9 @@ def download_youtube_song(query):
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": "downloaded_track.%(ext)s",
-        'cookiefile': 'cookies.txt',
-        "quiet": True, "noplaylist": True, "nocheckcertificate": True,
+        'username': 'oauth2',
+        'password': '',
+        "quiet": False, "noplaylist": True, "nocheckcertificate": True,
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav", "preferredquality": "192"}],
         'extractor_args': {'youtube': {'player_client': ['web']}}
     }
