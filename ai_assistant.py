@@ -13,6 +13,7 @@ from openwakeword.model import Model
 from google import genai
 from google.genai import types
 
+
 # --- 1. Gemini Configuration ---
 API_KEY = os.environ.get("GEMINI_API_KEY")
 if not API_KEY:
@@ -476,7 +477,7 @@ async def main():
     global auto_play_next, last_song_title, proactive_nudge_reason
     
     init_memory()
-    port = 8000
+    port = int(os.environ.get("PORT", 8000))
     print(f"[SYSTEM] Starting Jarvis 24/7 Server on 0.0.0.0:{port}...")
     await websockets.serve(ws_handler, "0.0.0.0", port)
     

@@ -11,7 +11,7 @@ python -m pip install -r requirement.txt
 Set your Gemini API key in the environment before running the assistant:
 
 ```powershell
-$env:GEMINI_API_KEY = "your-api-key"
+$env:GEMINI_API_KEY = "AIzaSyAT1QyoDPj2WV2EviKncjazcMLL7TKq70Y"
 python ai_assistant.py
 ```
 
