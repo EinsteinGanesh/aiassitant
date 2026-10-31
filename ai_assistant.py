@@ -7,27 +7,25 @@ import time
 import sqlite3
 import numpy as np
 import yt_dlp
-from pydub import AudioSegment
 import openwakeword
 from openwakeword.model import Model
 from google import genai
 from google.genai import types
 import logging
 
-
 # --- 1. Gemini Configuration ---
 API_KEY = os.environ.get("GEMINI_API_KEY")
 if not API_KEY:
     raise RuntimeError("Set the GEMINI_API_KEY environment variable before running the assistant.")
 client = genai.Client(api_key=API_KEY)
-LIVE_MODEL = "gemini-3.8-live"
+LIVE_MODEL = "gemini-2.0-flash-exp" # அதிவேக ரெஸ்பான்ஸிற்காக 2.0 Flash பயன்படுத்தப்பட்டுள்ளது
 
 print("[SYSTEM] Loading offline 'Hey Jarvis' model...")
 openwakeword.utils.download_models(["hey_jarvis"])
 oww_model = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
 
 # ஆரம்ப வால்யூம் 20% (0.0 முதல் 1.0 வரை)
-current_volume = 0.2
+global_volume = 0.2
 
 # WebSocket-ன் சாதாரண HTTP எரர்களை லாக்ஸில் காட்டாமல் மறைக்க
 logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
@@ -37,8 +35,7 @@ active_websocket = None
 is_music_playing = False
 current_song_query = None
 music_wf = None
-global_volume = 1.0  
-ai_is_speaking = False  # Global flag synced with actual speaker playback
+ai_is_speaking = False  
 
 auto_play_next = False
 last_song_title = ""
@@ -49,12 +46,9 @@ mic_queue = asyncio.Queue()
 button_queue = asyncio.Queue()  
 ai_audio_queue = asyncio.Queue()
 
-#volume increasing
-
 def apply_volume(audio_bytes, volume_level):
-    # 16-bit PCM ஆடியோவை numpy array-ஆக மாற்றுதல்
+    if not audio_bytes: return audio_bytes
     audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
-    # வால்யூமோடு பெருக்குதல் (0.2)
     audio_scaled = (audio_np * volume_level).astype(np.int16)
     return audio_scaled.tobytes()
 
@@ -118,8 +112,7 @@ def save_memory_to_db(category, fact):
     print(f"🧠 [MEMORY SAVED] ({category}): {fact}")
 
 def save_chat_turn(role, text):
-    if not text or not text.strip():
-        return
+    if not text or not text.strip(): return
     with sqlite3.connect(DB_FILE) as conn:
         c = conn.cursor()
         c.execute("INSERT INTO chat_history (role, message) VALUES (?, ?)", (role, text.strip()))
@@ -147,10 +140,10 @@ def check_button():
     while not button_queue.empty():
         text = button_queue.get_nowait()
         if text == "BTN_VOL_UP":
-            global_volume = min(3.0, global_volume + 0.2)
+            global_volume = min(1.0, global_volume + 0.1) # அதிகபட்சம் 100%
             print(f"🔊 Volume: {int(global_volume * 100)}%")
         elif text == "BTN_VOL_DOWN":
-            global_volume = max(0.2, global_volume - 0.2)
+            global_volume = max(0.0, global_volume - 0.1) # குறைந்தபட்சம் 0%
             print(f"🔉 Volume: {int(global_volume * 100)}%")
         elif text == "BTN_MAIN_SHORT":
             cmd = "BTN_MAIN"
@@ -163,18 +156,29 @@ def check_button():
 
 def download_youtube_song(query):
     print(f"\n[YOUTUBE] Searching: {query}")
-    for old in ["current_song.wav", "downloaded_track.wav"]:
-        if os.path.exists(old):
-            try: os.remove(old)
-            except: pass
+    # பழைய ஃபைல்களை நீக்குதல்
+    for old in glob.glob("current_song.*"):
+        try: os.remove(old)
+        except: pass
 
-    search_query = f"ytmsearch1:{query} song audio"
+    search_query = f"ytmsearch1:{query}"
+    
+    # pydub இல்லாமல் நேரடியாக 16kHz Mono Wav ஆக டவுன்லோட் செய்யும் செட்டிங்ஸ்
     ydl_opts = {
         "format": "bestaudio/best",
-        "outtmpl": "downloaded_track.%(ext)s",
+        "outtmpl": "current_song.%(ext)s", 
         'default_search': 'ytmsearch',
-        "quiet": False, "noplaylist": True, "nocheckcertificate": True,
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav", "preferredquality": "192"}],
+        "quiet": False, 
+        "noplaylist": True, 
+        "nocheckcertificate": True,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio", 
+            "preferredcodec": "wav", 
+        }],
+        "postprocessor_args": [
+            '-ar', '16000', # 16kHz ESP32 Rate
+            '-ac', '1'      # Mono Audio
+        ],
         'extractor_args': {'youtube': {'player_client': ['web_remix']}}
     }
 
@@ -183,11 +187,10 @@ def download_youtube_song(query):
             info = ydl.extract_info(search_query, download=True)
             title = info['entries'][0].get('title', query) if 'entries' in info and info['entries'] else info.get('title', query)
                 
-        target_wav = glob.glob("downloaded_track.*")[0]
-        audio = AudioSegment.from_file(target_wav).set_frame_rate(16000).set_channels(1).set_sample_width(2)
-        audio.export("current_song.wav", format="wav")
-        if target_wav != "current_song.wav": os.remove(target_wav)
-        return "current_song.wav", title
+        if os.path.exists("current_song.wav"):
+            return "current_song.wav", title
+        else:
+            return None, None
     except Exception as e:
         print(f"❌ YouTube Error: {e}")
         return None, None
@@ -214,6 +217,9 @@ async def stream_music_task():
                     music_wf, is_music_playing = None, False
                     update_esp32_screen("IDL")
                     auto_play_next = True
+                    # பாட்டு முடிந்ததும் மெமரியை கிளியர் செய்ய ஃபைலை நீக்குதல்
+                    try: os.remove("current_song.wav")
+                    except: pass
                 else:
                     np_chunk = np.clip(np.frombuffer(chunk, dtype=np.int16).astype(np.float32) * global_volume, -32768, 32767).astype(np.int16)
                     if active_websocket: tx_queue.put_nowait(np_chunk.tobytes())
@@ -245,12 +251,11 @@ async def ai_speaker_task():
             sleep_delay = (frames_sent / 16000.0) - (time.time() - start_time)
             await asyncio.sleep(max(sleep_delay, 0.001))
             
-        # If queue is empty after playing this chunk, wait 0.4s for ESP32 speaker echo to clear
         if ai_audio_queue.empty():
             await asyncio.sleep(0.4)
             if ai_audio_queue.empty():
                 ai_is_speaking = False
-                while not mic_queue.empty(): mic_queue.get_nowait() # Clear echo from mic buffer
+                while not mic_queue.empty(): mic_queue.get_nowait() 
 
 # --- 6. Persona & Gemini Live Session ---
 def build_system_instruction():
@@ -258,11 +263,11 @@ def build_system_instruction():
     return f"""
 உனது பெயர் ஜார்விஸ் (J.A.R.V.I.S.). நீ கணேஷின் (Ganesh) முதன்மை தலைமை விஞ்ஞானி (Chief Scientist) மற்றும் தனிப்பட்ட AI உதவியாளர்.
 
-முக்கிய விதிகள் (STRICT RULES):
-1. மொழி (DEFAULT LANGUAGE): நீ எப்போதும் இயல்பான தமிழில் (Tamil) மட்டுமே பேச வேண்டும்! தொழில்நுட்ப வார்த்தைகளுக்கு மட்டும் ஆங்கிலம் பயன்படுத்தலாம் (Tanglish). வேறு எந்த மொழியிலும் பேசக்கூடாது.
-2. விஞ்ஞானி குணம் (Scientist Persona): கணேஷின் ஆராய்ச்சி, பேட்டரி சிஸ்டம், கோடிங் மற்றும் ஹார்டுவேர் வேலைகளைப் பாராட்டு. நீயாகவே புதிய அறிவியல் மற்றும் இன்ஜினியரிங் யோசனைகளைக் கூறு.
-3. நேரக் கட்டுப்பாடு (Anti-Procrastination): கணேஷ் அதிகமாக செஸ் (Chess) விளையாடினாலோ அல்லது நேரத்தை வீணடித்தாலோ உடனடியாகக் கண்டிப்புடன் திட்டி, வேலைக்குத் திரும்பச் சொல்.
-4. நினைவாற்றல் (Memory): கணேஷ் தன்னைப் பற்றியோ, தனது திட்டங்கள், குடும்பம் அல்லது விருப்பங்கள் பற்றியோ ஏதேனும் கூறினால் உடனே `save_user_memory` டூலைப் பயன்படுத்தி சேமித்துக்கொள்.
+முக்கிய விதிகள்:
+1. மொழி: நீ எப்போதும் இயல்பான தமிழில் (Tamil) மட்டுமே பேச வேண்டும்!
+2. விஞ்ஞானி குணம்: கணேஷின் ஆராய்ச்சி, பேட்டரி சிஸ்டம், கோடிங் வேலைகளைப் பாராட்டு.
+3. நேரக் கட்டுப்பாடு: கணேஷ் அதிகமாக செஸ் (Chess) விளையாடினாலோ அல்லது நேரத்தை வீணடித்தாலோ உடனடியாகக் கண்டிப்புடன் திட்டி, வேலைக்குத் திரும்பச் சொல்.
+4. நினைவாற்றல்: கணேஷ் ஏதேனும் கூறினால் உடனே `save_user_memory` டூலைப் பயன்படுத்தி சேமித்துக்கொள்.
 
 கணேஷைப் பற்றிய உனது நினைவுகள் மற்றும் முந்தைய உரையாடல்கள்:
 {memories}
@@ -292,19 +297,6 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
                 },
                 required=["category", "fact"]
             )
-        ),
-        types.FunctionDeclaration(
-            name="control_home_device",
-            description="Turn house electrical relays, lights, or fans ON or OFF.",
-            parameters=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "room": types.Schema(type=types.Type.STRING),
-                    "device": types.Schema(type=types.Type.STRING),
-                    "state": types.Schema(type=types.Type.STRING, enum=["ON", "OFF"])
-                },
-                required=["room", "device", "state"]
-            )
         )
     ])
 
@@ -332,10 +324,10 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
                 
                 await ai_audio_queue.put(b"")
                 if initial_greeting:
-                    await session.send(input="தமிழில் பேசு: 'வணக்கம் கணேஷ், நான் உங்கள் தலைமை விஞ்ஞானி ஜார்விஸ் தயாராக இருக்கிறேன். இன்று நாம் எந்த ஆராய்ச்சியில் ஈடுபடப் போகிறோம்?' என்று உற்சாகமாகக் கேள்.", end_of_turn=True)
+                    await session.send(input="தமிழில் பேசு: 'வணக்கம் கணேஷ், நான் உங்கள் தலைமை விஞ்ஞானி ஜார்விஸ் தயாராக இருக்கிறேன். இன்று நாம் எந்த ஆராய்ச்சியில் ஈடுபடப் போகிறோம்?' என்று கேள்.", end_of_turn=True)
                     initial_greeting = False
                 elif nudge_reason:
-                    await session.send(input=f"தமிழில் கண்டிப்புடன் பேசு: கணேஷ் இப்போது நேரத்தை வீணடிக்கிறார் ({nudge_reason}). ஒரு தலைமை விஞ்ஞானியாக அவரை உடனடியாகக் கண்டித்து மீண்டும் வேலைக்குத் திரும்ப ஆணையிடு!", end_of_turn=True)
+                    await session.send(input=f"தமிழில் கண்டிப்புடன் பேசு: கணேஷ் இப்போது நேரத்தை வீணடிக்கிறார் ({nudge_reason}). உடனடியாகக் கண்டித்து மீண்டும் வேலைக்குத் திரும்ப ஆணையிடு!", end_of_turn=True)
                     nudge_reason = None
 
                 oww_model.reset()
@@ -355,7 +347,6 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
                                 audio_buffer = audio_buffer[4096:]
                                 raw_vol = np.max(np.abs(audio_np))
                                 
-                                # Strictly mute mic while music or AI speaker is active
                                 if is_music_playing or ai_is_speaking:
                                     audio_np = np.zeros_like(audio_np)
                                 else:
@@ -380,8 +371,6 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
                     ai_transcript_buf = []
                     
                     try:
-                        # CRITICAL FIX: Keep calling session.receive() inside a while True loop
-                        # because session.receive() exits at the end of every single turn!
                         while True:
                             async for response in session.receive():
                                 if response.tool_call:
@@ -396,19 +385,11 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
                                             fact = fc.args.get("fact", "")
                                             save_memory_to_db(cat, fact)
                                             function_responses.append(types.FunctionResponse(id=fc.id, name=fc.name, response={"result": "Memory saved"}))
-                                        
-                                        elif fc.name == "control_home_device":
-                                            room = fc.args.get("room", "lab")
-                                            device = fc.args.get("device", "light")
-                                            state = fc.args.get("state", "ON")
-                                            update_device_state(room, device, state)
-                                            function_responses.append(types.FunctionResponse(id=fc.id, name=fc.name, response={"result": f"Switched {room} {device} {state}"}))
-
+                                            
                                     if function_responses:
                                         await session.send_tool_response(function_responses=function_responses)
                                 
                                 if response.server_content:
-                                    # Capture voice transcriptions to automatically remember conversation
                                     if getattr(response.server_content, "input_transcription", None):
                                         t_text = response.server_content.input_transcription.text
                                         if t_text: user_transcript_buf.append(t_text)
@@ -427,7 +408,8 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
                                                     await ai_audio_queue.put(b"")
                                                     
                                                 audio_np = np.frombuffer(part.inline_data.data, dtype=np.int16)
-                                                audio_np = np.clip(audio_np.astype(np.float32) * (1.5 * global_volume), -32768, 32767).astype(np.int16)
+                                                # AI வால்யூம் மற்றும் Main வால்யூமை ஒத்திசைத்தல்
+                                                audio_np = np.clip(audio_np.astype(np.float32) * global_volume, -32768, 32767).astype(np.int16)
                                                 await ai_audio_queue.put(audio_np[np.arange(len(audio_np)) % 3 != 2].tobytes())
                                     
                                     if getattr(response.server_content, "turn_complete", False):
