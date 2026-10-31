@@ -175,7 +175,7 @@ def download_youtube_song(query):
         'cookiefile': 'cookies.txt',
         "quiet": True, "noplaylist": True, "nocheckcertificate": True,
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav", "preferredquality": "192"}],
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}}
+        'extractor_args': {'youtube': {'player_client': ['web']}}
     }
 
     try:
