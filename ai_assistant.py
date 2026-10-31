@@ -12,6 +12,7 @@ import openwakeword
 from openwakeword.model import Model
 from google import genai
 from google.genai import types
+import logging
 
 
 # --- 1. Gemini Configuration ---
@@ -24,6 +25,9 @@ LIVE_MODEL = "gemini-3.8-live"
 print("[SYSTEM] Loading offline 'Hey Jarvis' model...")
 openwakeword.utils.download_models(["hey_jarvis"])
 oww_model = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+
+# WebSocket-ன் சாதாரண HTTP எரர்களை லாக்ஸில் காட்டாமல் மறைக்க
+logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
 
 # --- 2. Global State & Queues ---
 active_websocket = None
