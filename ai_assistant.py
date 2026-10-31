@@ -168,15 +168,14 @@ def download_youtube_song(query):
             try: os.remove(old)
             except: pass
 
-    search_query = f"ytsearch1:{query} song audio"
+    search_query = f"ytmsearch1:{query} song audio"
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": "downloaded_track.%(ext)s",
-        'username': 'oauth2',
-        'password': '',
+        'default_search': 'ytmsearch',
         "quiet": False, "noplaylist": True, "nocheckcertificate": True,
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav", "preferredquality": "192"}],
-        'extractor_args': {'youtube': {'player_client': ['web']}}
+        'extractor_args': {'youtube': {'player_client': ['web_remix']}}
     }
 
     try:
