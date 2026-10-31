@@ -12,6 +12,7 @@ from openwakeword.model import Model
 from google import genai
 from google.genai import types
 import logging
+import requests
 
 # --- 1. Gemini Configuration ---
 API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -155,45 +156,69 @@ def check_button():
     return cmd
 
 def download_youtube_song(query):
-    print(f"\n[MUSIC] Searching: {query}")
+    print(f"\n[MUSIC] Searching YouTube: {query}")
     for old in glob.glob("current_song.*"):
         try: os.remove(old)
         except: pass
 
-    # யூடியூப் Bot பிளாக்கைத் தவிர்க்க SoundCloud சர்ச் (scsearch1) பயன்படுத்துதல்
-    search_query = f"scsearch1:{query}"
-    
+    # முயற்சி 1: YouTube (TV & iOS Client + Deno வழியாக)
     ydl_opts = {
         "format": "bestaudio/best",
-        "outtmpl": "current_song.%(ext)s", 
-        "quiet": False, 
-        "noplaylist": True, 
+        "outtmpl": "current_song.%(ext)s",
+        "default_search": "ytsearch1",
+        "quiet": True,
+        "noprogress": True,
+        "noplaylist": True,
         "nocheckcertificate": True,
         "postprocessors": [{
-            "key": "FFmpegExtractAudio", 
-            "preferredcodec": "wav", 
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "wav",
         }],
-        "postprocessor_args": [
-            '-ar', '16000', # 16kHz ESP32 Rate
-            '-ac', '1'      # Mono Audio
-        ]
+        "postprocessor_args": ['-ar', '16000', '-ac', '1'],
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios", "tv", "web_embedded"]
+            }
+        }
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(search_query, download=True)
-            if 'entries' in info and len(info['entries']) > 0:
-                title = info['entries'][0].get('title', query)
-            else:
-                title = info.get('title', query)
-                
+            info = ydl.extract_info(f"{query} tamil song audio", download=True)
+            title = info['entries'][0].get('title', query) if 'entries' in info and info['entries'] else info.get('title', query)
         if os.path.exists("current_song.wav"):
+            print(f"✅ Downloaded from YouTube: {title}")
             return "current_song.wav", title
-        else:
-            return None, None
     except Exception as e:
-        print(f"❌ Music Download Error: {e}")
-        return None, None
+        print(f"⚠️ YouTube Blocked on Cloud IP ({e}). Switching to JioSaavn Full Song Backup...")
+
+    # முயற்சி 2: JioSaavn (யூடியூப் பிளாக் செய்தால் முழுப் பாட்டை எடுக்க)
+    try:
+        resp = requests.get(f"https://saavn.dev/api/search/songs?query={query}", timeout=10).json()
+        if resp.get("data") and resp["data"].get("results"):
+            song_data = resp["data"]["results"][0]
+            title = song_data.get("name", query)
+            # 160kbps அல்லது 320kbps முழு ஆடியோ லிங்க்
+            dl_url = song_data["downloadUrl"][-1]["url"]
+            
+            saavn_opts = {
+                "format": "bestaudio/best",
+                "outtmpl": "current_song.%(ext)s",
+                "quiet": True,
+                "noprogress": True,
+                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
+                "postprocessor_args": ['-ar', '16000', '-ac', '1']
+            }
+            with yt_dlp.YoutubeDL(saavn_opts) as ydl:
+                ydl.download([dl_url])
+                
+            if os.path.exists("current_song.wav"):
+                print(f"✅ Downloaded Full Song from JioSaavn: {title}")
+                return "current_song.wav", title
+    except Exception as e2:
+        print(f"❌ Music Error: {e2}")
+
+    return None, None
 
 # --- 5. Audio Streaming Tasks ---
 async def stream_music_task():
