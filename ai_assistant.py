@@ -414,6 +414,8 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
                                         if fc.name == "play_music":
                                             current_song_query = fc.args.get("song_name", "")
                                             function_responses.append(types.FunctionResponse(id=fc.id, name=fc.name, response={"result": "Playing song now"}))
+                                            await session.send_tool_response(function_responses=function_responses)
+                                            return
                                         
                                         elif fc.name == "save_user_memory":
                                             cat = fc.args.get("category", "General")
