@@ -156,18 +156,17 @@ def check_button():
 
 def download_youtube_song(query):
     print(f"\n[YOUTUBE] Searching: {query}")
-    # பழைய ஃபைல்களை நீக்குதல்
     for old in glob.glob("current_song.*"):
         try: os.remove(old)
         except: pass
 
-   search_query = f"{query} audio"
+    # 'ytmsearch1:' என்பதை நீக்கிவிட்டு நேரடியாகப் பாட்டின் பெயரை மட்டும் தேடுதல்
+    search_query = f"{query} audio"
     
-    # pydub இல்லாமல் நேரடியாக 16kHz Mono Wav ஆக டவுன்லோட் செய்யும் செட்டிங்ஸ்
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": "current_song.%(ext)s", 
-        "default_search": "ytsearch1"
+        "default_search": "ytsearch1",  # செட்டிங்ஸ் வழியாகவே 1st ரிசல்ட்டை எடுக்கச் சொல்வது
         "quiet": False, 
         "noplaylist": True, 
         "nocheckcertificate": True,
@@ -176,10 +175,10 @@ def download_youtube_song(query):
             "preferredcodec": "wav", 
         }],
         "postprocessor_args": [
-            '-ar', '16000', # 16kHz ESP32 Rate
-            '-ac', '1'      # Mono Audio
+            '-ar', '16000', # 16kHz ரேட்
+            '-ac', '1'      # Mono ஆடியோ
         ],
-        "extractor_args": {'youtube': {'player_client': ['web_remix']}}
+        "extractor_args": {'youtube': {'player_client': ['web_remix']}} # யூடியூப் Bot எரரைத் தவிர்க்க
     }
 
     try:
