@@ -178,7 +178,7 @@ def download_youtube_song(query):
             '-ar', '16000', # 16kHz ரேட்
             '-ac', '1'      # Mono ஆடியோ
         ],
-        "extractor_args": {'youtube': {'player_client': ['web_remix']}} # யூடியூப் Bot எரரைத் தவிர்க்க
+       "extractor_args": {'youtube': {'player_client': ['android', 'ios']}} # யூடியூப் Bot எரரைத் தவிர்க்க
     }
 
     try:
