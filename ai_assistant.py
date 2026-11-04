@@ -162,7 +162,7 @@ def download_youtube_song(query):
         try: os.remove(old)
         except: pass
 
-    # பல JioSaavn API சர்வர்கள் (ஒன்று பிஸியாக இருந்தால் மற்றொன்று உடனே வேலை செய்யும்)
+    # JioSaavn API முகவரிகள் (தமிழ் மற்றும் அனைத்து மொழிப் பாடல்களுக்கும்)
     saavn_apis = [
         f"https://saavn.dev/api/search/songs?query={query}",
         f"https://jiosaavn-api-privatecvc2.vercel.app/search/songs?query={query}",
@@ -177,7 +177,6 @@ def download_youtube_song(query):
             print(f"🔍 Trying API: {api_url.split('/')[2]}...")
             resp = requests.get(api_url, timeout=6).json()
             
-            # API வடிவத்திற்கு ஏற்ப Results எடுத்தல்
             results = resp.get("data", {}).get("results") or resp.get("results") or resp.get("data")
             if isinstance(results, list) and len(results) > 0:
                 song = results[0]
@@ -185,7 +184,6 @@ def download_youtube_song(query):
                 dl_links = song.get("downloadUrl")
                 
                 if isinstance(dl_links, list) and len(dl_links) > 0:
-                    # 160kbps அல்லது 320kbps லிங்க் எடுத்தல்
                     stream_url = dl_links[-1].get("url") or dl_links[-1].get("link")
                     if stream_url:
                         break
@@ -198,13 +196,13 @@ def download_youtube_song(query):
 
     try:
         print(f"⬇️ Downloading Audio File: {title}")
-        # 1. முதலில் ஆடியோ ஃபைலை நேரடியாக டவுன்லோட் செய்தல் (Stuck ஆகாமல் இருக்க)
+        # 1. ஆடியோ ஃபைலை நேரடியாக டவுன்லோட் செய்தல்
         audio_data = requests.get(stream_url, timeout=15).content
         with open("temp_audio.m4a", "wb") as f:
             f.write(audio_data)
 
         print("🔄 Converting to ESP32 WAV format (16kHz Mono)...")
-        # 2. டவுன்லோட் ஆன ஃபைலை சுத்தமான 16kHz WAV ஆக மாற்றுதல் (-fflags +bitexact மூலம் wave.open எரர் தடுக்கப்படும்)
+        # 2. FFmpeg மூலம் ESP32-க்கு ஏற்ற 16kHz WAV ஆக மாற்றுதல்
         cmd = [
             "ffmpeg", "-y", "-i", "temp_audio.m4a",
             "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
@@ -409,7 +407,8 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
                                     for fc in response.tool_call.function_calls:
                                         if fc.name == "play_music":
                                             current_song_query = fc.args.get("song_name", "")
-                                            function_responses.append(types.FunctionResponse(id=fc.id, name=fc.name, response={"result": "Playing song now"}))
+                                            print(f"\n🎵 [TOOL CALL] Song requested: {current_song_query}")
+                                            function_responses.append(types.FunctionResponse(id=fc.id, name=fc.name, response={"result": "Playing song immediately"}))
                                             await session.send_tool_response(function_responses=function_responses)
                                             return
                                         
