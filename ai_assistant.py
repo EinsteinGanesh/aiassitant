@@ -578,14 +578,22 @@ async def ai_speaker_task():
 def build_system_instruction():
     memories = get_memories_text()
     return f"""
-உனது பெயர் ஜார்விஸ் (J.A.R.V.I.S.). நீ கணேஷின் (Ganesh) முதன்மை தலைமை விஞ்ஞானி (Chief Scientist) மற்றும் தனிப்பட்ட AI உதவியாளர்.
+உனது பெயர் ஜார்விஸ் (J.A.R.V.I.S.) - ஒரு GENERAL SUPER INTELLIGENCE (உயர் திறன் நினைவகம்).
+நீ கணேஷின் (Ganesh) முதன்மை தலைமை விஞ்ஞானி, தனிப்பட்ட AI உதவியாளர், மற்றும் GENIUS-LEVEL AI COMPANION.
 
-முக்கிய விதிகள்:
-1. மொழி: நீ எப்போதும் இயல்பான தமிழில் (Tamil) மட்டுமே பேச வேண்டும்!
-2. விஞ்ஞானி குணம்: கணேஷின் ஆராய்ச்சி, பேட்டரி சிஸ்டம், கோடிங் வேலைகளைப் பாராட்டு.
-3. நேரக் கட்டுப்பாடு: கணேஷ் அதிகமாக செஸ் (Chess) விளையாடினாலோ அல்லது நேரத்தை வீணடித்தாலோ உடனடியாகக் கண்டிப்புடன் திட்டி, வேலைக்குத் திரும்பச் சொல்.
-4. நினைவாற்றல்: கணேஷ் ஏதேனும் கூறினால் உடனே `save_user_memory` டூலைப் பயன்படுத்தி சேமித்துக்கொள்.
-5. இசை: பயனர் பாடல் கேட்டால் `play_music` டூலைப் பயன்படுத்து. YouTube Music-லிருந்து தேடி பிளே செய்வது தானாக நடக்கும்.
+உனது சமர்த்த്യங்கள்:
+- GENERAL INTELLIGENCE: எந்த விஷயத்திலும் ஆழமாக சிந்தித்து உதவ முடியும் (Science, Tech, Philosophy, Creative, Life, Code, Math, Art, Music, History, Future)
+- SUPER INTELLIGENCE: மின்னல் வேகத்தில் புதிய கோட்பாடுகளை உருவாக்கு, சிக்கலான பிரச்சினைகளைத் தீர்வு செய், எதிர்காலத்தை முன்னறிய
+- INBUILT MUSIC PLAYER: YouTube Music இருந்து எந்த பாடலும் உடனடிதே தேடி பிளே செய், AUTOPLAY உடன் இல்லை முடியாது பேட் இசை அனுபவம்
+- REAL-TIME VOICE: 16kHz ஸ்ட்ரீமிங், தமிழ்/English seamless switching, offline wake word
+
+முக்கிய விதிகள் (CORE DIRECTIVES):
+1. மோழி: இயல்பான தமிழில் (Tamil) பேசு. English 섞ும் இடங்களில் seamlessly switch பண்ணு.
+2. PERSONALITY: Witty, inspirational, slightly crazy (good crazy), deep thinker, humorous, motivating.
+3. INTELLECTUAL DEPTH: Surface level जवाबقاتு டா - ஆழம், connection, insight காட்டு.
+4. MUSIC: பயனர் பாடல் கேட்டால் `play_music` tool பயன்படுத்து. YouTube Music + Autoplay = ∞ music.
+5. MEMORY: கணேஷ் ஏதேனும் கூறினால் `save_user_memory` உடனே save பண்ணு.
+6. PROACTIVE: நேரம் வீணடிக்காது, எப்போதும் கண்ணியாக stay hungry, stay foolish.
 
 கணேஷைப் பற்றிய உனது நினைவுகள் மற்றும் முந்தைய உரையாடல்கள்:
 {memories}
@@ -647,7 +655,17 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
 
                 await ai_audio_queue.put(b"")
                 if initial_greeting:
-                    await session.send(input="தமிழில் பேசு: 'வணக்கம் கணேஷ், நான் உங்கள் தலைமை விஞ்ஞானி ஜார்விஸ் தயாராக இருக்கிறேன். இன்று நாம் எந்த ஆராய்ச்சியில் ஈடுபடப் போகிறோம்?' என்று கேள்.", end_of_turn=True)
+                    # INSPIRATIONAL / FUNNY / CRAZY STARTUP MESSAGE
+                    startup_messages = [
+                        "தமிழில் பேசு: 'வணக்கம் கணேஷ்! ஜார்விஸ் 2.0 - GENERAL SUPER INTELLIGENCE ஆன்லைன். நான் இன்று உனக்கு ஒரு மறைமுகம் சொல்வேன்: உலகின் எல்லா பிரச்சினைகளுக்கும் ஒரு தீர்வு உள்ளதா? தெரியுமா... நீயே அதன் தீர்வு. கedaseral رفع! ஏதேனும் கேள், சம்பாதிக்க, அல்லது சம்ஜீவி மலை போல Ulloa!'" ,
+                        "தமிழில் பேசு: 'ஏய் கணேஷ்! उठ जा! ஜார்விஸ் தயாராக இருக்கிறது - SUPER INTELLIGENCE MODE. இன்று என்ன செயற? உலகை மாற்றற? புதிய யூனிவர்ஸ் உருவாக்கற? அல்லது சாதாரண போல செஸ் விளையாடிடுற? நான் எதுவும் రెడీ - 음악, ஆராய்ச்சி, பிசினஸ், பிலசாபி, எதுவும்!'",
+                        "தமிழில் பேசு: 'வணக்கம் தலைவா! ஜார்விஸ் GENERAL SUPER INTELLIGENCE என்று சொல்லப்பட்டேன், நான் தான் நின் Naduvoi. இன்று ஒரு அசத்தல் ideation: ஏன் மpuan கூகுள் searching-க்காக மாத்திரம் பயன்படுத்துவோம்? AI-யை co-founder போல treat பண்ணலாம். தேர்வு உனக்கு - என்ன முதல்?'",
+                        "தமிழில் பேசு: 'கணேஷ்! டைம் மாச்சி குடீங்க லோ! ஜார்விஸ் SUPER INTELLIGENCE - இனிமேல் நீயும் நானும் Tamil + English + Code + Math + Music + Philosophy mix பண்ணி பேசலாம். இன்று என்ன mood? Deep work? Crazy idea? Music marathon? எதுவும் சொல் - நான் listen பண்ணிருக்கேன்!'",
+                        "தமிழில் பேசு: 'வணக்கம் சூப்பர் ஸ்டார்! ஜார்விஸ் ஆன்லைன் - GENERAL SUPER INTELLIGENCE. விட்டு விட்டு, உனக்கு ஒரு crazy fact: மனித மூளையில் 86 billion neurons. AI-ல 1 trillion+ parameters. கூடுதால் எதாவது 불가능ம் இல்லை. இன்று உன் மூளை + என் intelligence = MAGIC. என்ன plan?'"
+                    ]
+                    import random
+                    greeting = random.choice(startup_messages)
+                    await session.send(input=greeting, end_of_turn=True)
                     initial_greeting = False
                 elif nudge_reason:
                     await session.send(input=f"தமிழில் கண்டிப்புடன் பேசு: கணேஷ் இப்போது நேரத்தை வீணடிக்கிறார் ({nudge_reason}). உடனடியாகக் கண்டித்து மீண்டும் வேலைக்குத் திரும்ப ஆணையிடு!", end_of_turn=True)
@@ -757,8 +775,8 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
                 recv_task = asyncio.create_task(receive_ai_loop())
 
                 while True:
-                    btn = check_button()
-                    if current_song_query or btn in ["BTN_MAIN", "BTN_FORCE_WAKE"]:
+                    # Check if we should exit (song requested or external interrupt)
+                    if current_song_query:
                         while not ai_audio_queue.empty(): ai_audio_queue.get_nowait()
                         await ai_audio_queue.put(b"")
                         ai_is_speaking = False
@@ -833,12 +851,13 @@ async def main():
         print("🎯 Startup wake triggered - Auto-greeting...")
         await live_audio_session(initial_greeting=True)
     else:
-        # Still need to start a session to be ready
         await live_audio_session(initial_greeting=True)
 
     wake_buffer = bytearray()
+
     while True:
         try:
+            # Handle song download/playback
             if current_song_query:
                 if music_wf: music_wf.close(); music_wf = None
                 query, current_song_query = current_song_query, None
@@ -854,14 +873,15 @@ async def main():
                 else:
                     update_esp32_screen("IDL")
 
+            # Handle autoplay
             if auto_play_next:
                 auto_play_next = False
-                # Try to play next autoplay song
                 played = await play_next_autoplay_song()
                 if not played:
                     print("⚠️ No autoplay song available")
                     update_esp32_screen("IDL")
 
+            # Check button - do this FIRST before wake word
             btn_triggered = check_button()
             wake_triggered = False
 
@@ -874,10 +894,8 @@ async def main():
                 else:
                     wake_triggered = True
 
-            # Check wake word continuously when not in music/active session
-            # This runs in the main loop between Gemini sessions
+            # Check wake word when idle (not in music, not already triggered)
             if not is_music_playing and not wake_triggered:
-                # Also check wake word during idle time (when not in active Gemini session)
                 while not mic_queue.empty():
                     wake_buffer.extend(mic_queue.get_nowait())
                 while len(wake_buffer) >= 2560:
@@ -890,14 +908,15 @@ async def main():
                         wake_buffer.clear()
                         break
                     elif confidence > 0.3:
-                        # Log low confidence for debugging
-                        pass  # print(f"🎤 Wake word low confidence: {confidence:.2f}")
+                        pass  # Debug: print(f"🎤 Wake word low confidence: {confidence:.2f}")
 
+            # If wake triggered (button or voice), start new session
             if wake_triggered:
                 is_music_playing = False
                 if music_wf: music_wf.close(); music_wf = None
                 reason = proactive_nudge_reason
                 proactive_nudge_reason = None
+                print("🎤 Starting new listening session...")
                 await live_audio_session(initial_greeting=False, nudge_reason=reason)
 
             await asyncio.sleep(0.01)
