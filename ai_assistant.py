@@ -28,6 +28,7 @@ LIVE_MODEL = "gemini-3.8-live" # அதிவேக ரெஸ்பான்ஸ�
 print("[SYSTEM] Loading offline 'Hey Jarvis' model...")
 # Initialize oww_model as None - will be set by successful initialization
 oww_model = None
+oww_model_loaded = False
 
 # openwakeword version compatibility: try different download methods
 try:
@@ -67,10 +68,12 @@ except (ImportError, AttributeError):
 if oww_model is None:
     try:
         oww_model = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+        oww_model_loaded = True
         print("✅ 'Hey Jarvis' model loaded successfully")
     except Exception as e:
         print(f"⚠️ Could not load model: {e}")
         print("⚠️ Wake word detection disabled - use button press to wake")
+        oww_model_loaded = False
         # Create a dummy model that always returns False
         class DummyOWWModel:
             def predict(self, x):
@@ -78,6 +81,9 @@ if oww_model is None:
             def reset(self):
                 pass
         oww_model = DummyOWWModel()
+
+# Force wake on startup so assistant is ready immediately
+STARTUP_WAKE_ENABLED = True
 
 # ஆரம்ப வால்யூம் 20% (0.0 முதல் 1.0 வரை)
 global_volume = 0.2
@@ -627,12 +633,17 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
     user_ended_call = False
     while not mic_queue.empty(): mic_queue.get_nowait()
 
-    while not user_ended_call and not current_song_query:
+    # Retry loop for Gemini connection
+    max_retries = 3
+    retry_count = 0
+
+    while not user_ended_call and not current_song_query and retry_count < max_retries:
         try:
-            print("\n🔄 Connecting to Gemini Live API...")
+            print(f"\n🔄 Connecting to Gemini Live API... (attempt {retry_count + 1}/{max_retries})")
             async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
                 update_esp32_screen("LIS")
                 print("✅ [LISTENING] Jarvis is online! (Continuous Session)")
+                retry_count = 0  # Reset on successful connection
 
                 await ai_audio_queue.put(b"")
                 if initial_greeting:
@@ -756,14 +767,24 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
                         break
 
                     if send_task.done() or recv_task.done():
+                        # Task ended unexpectedly - log and break to reconnect
+                        if send_task.done() and send_task.exception():
+                            print(f"❌ Send task failed: {send_task.exception()}")
+                        if recv_task.done() and recv_task.exception():
+                            print(f"❌ Receive task failed: {recv_task.exception()}")
                         send_task.cancel(); recv_task.cancel()
                         break
 
                     await asyncio.sleep(0.02)
 
         except Exception as e:
-            print(f"❌ [GEMINI CONNECTION ERROR] {e}")
-            await asyncio.sleep(2)
+            retry_count += 1
+            print(f"❌ [GEMINI CONNECTION ERROR] {e} (retry {retry_count}/{max_retries})")
+            if retry_count < max_retries:
+                await asyncio.sleep(2)
+            else:
+                print("❌ Max retries reached, giving up on this session")
+                break
 
     update_esp32_screen("IDL")
 
@@ -797,14 +818,23 @@ async def main():
     print(f"[SYSTEM] Starting Jarvis 24/7 Server on 0.0.0.0:{port}...")
     print(f"[SYSTEM] YouTube Music integration: {'ENABLED' if os.path.exists(COOKIES_FILE) else 'DISABLED (no cookies.txt)'}")
     print(f"[SYSTEM] Autoplay: {'ENABLED' if autoplay_enabled else 'DISABLED'}")
+    print(f"[SYSTEM] Wake word model: {'LOADED' if oww_model_loaded else 'DISABLED (button only)'}")
     await websockets.serve(ws_handler, "0.0.0.0", port)
 
     asyncio.create_task(stream_music_task())
     asyncio.create_task(ai_speaker_task())
 
+    # Wait for ESP32 connection
     while active_websocket is None: await asyncio.sleep(0.1)
+    print("✅ ESP32 connected - Starting assistant...")
 
-    await live_audio_session(initial_greeting=True)
+    # STARTUP WAKE: Auto-greet when ESP32 connects
+    if STARTUP_WAKE_ENABLED:
+        print("🎯 Startup wake triggered - Auto-greeting...")
+        await live_audio_session(initial_greeting=True)
+    else:
+        # Still need to start a session to be ready
+        await live_audio_session(initial_greeting=True)
 
     wake_buffer = bytearray()
     while True:
@@ -844,15 +874,24 @@ async def main():
                 else:
                     wake_triggered = True
 
+            # Check wake word continuously when not in music/active session
+            # This runs in the main loop between Gemini sessions
             if not is_music_playing and not wake_triggered:
-                while not mic_queue.empty(): wake_buffer.extend(mic_queue.get_nowait())
+                # Also check wake word during idle time (when not in active Gemini session)
+                while not mic_queue.empty():
+                    wake_buffer.extend(mic_queue.get_nowait())
                 while len(wake_buffer) >= 2560:
                     chunk, wake_buffer = wake_buffer[:2560], wake_buffer[2560:]
-                    if oww_model.predict(np.frombuffer(chunk, dtype=np.int16)).get("hey_jarvis", 0.0) > 0.5:
-                        print("✨ Wake word detected!")
+                    prediction = oww_model.predict(np.frombuffer(chunk, dtype=np.int16))
+                    confidence = prediction.get("hey_jarvis", 0.0)
+                    if confidence > 0.5:
+                        print(f"✨ Wake word detected! (confidence: {confidence:.2f})")
                         wake_triggered = True
                         wake_buffer.clear()
                         break
+                    elif confidence > 0.3:
+                        # Log low confidence for debugging
+                        pass  # print(f"🎤 Wake word low confidence: {confidence:.2f}")
 
             if wake_triggered:
                 is_music_playing = False
@@ -864,6 +903,9 @@ async def main():
             await asyncio.sleep(0.01)
         except KeyboardInterrupt:
             break
+        except Exception as e:
+            print(f"❌ Main loop error: {e}")
+            await asyncio.sleep(1)
 
 if __name__ == "__main__":
     asyncio.run(main())
