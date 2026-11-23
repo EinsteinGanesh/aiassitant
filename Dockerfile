@@ -1,16 +1,33 @@
-FROM python:3.11-slim
+# Use Python 3.12 slim as base
+FROM python:3.12-slim
 
-# FFmpeg மற்றும் Deno (YouTube JS Challenge Solver) இன்ஸ்டால் செய்தல்
-RUN apt-get update && apt-get install -y ffmpeg curl unzip \
-    && curl -fsSL https://deno.land/install.sh | sh
-ENV PATH="/root/.deno/bin:$PATH"
+# Install system dependencies including ffmpeg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
 
+# Set working directory
 WORKDIR /app
-COPY . .
 
-RUN pip install --no-cache-dir --upgrade pip
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
-# YouTube பிளாக்கைத் தவிர்க்க டெய்லி அப்டேட் ஆகும் yt-dlp nightly வெர்ஷன்
+# Install latest yt-dlp with all features for YouTube Music
 RUN pip install --no-cache-dir -U --pre "yt-dlp[default]"
 
+# Copy application code
+COPY *.py .
+COPY cookies.txt .
+
+# Create non-root user for security
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Expose port
+EXPOSE 8000
+
+# Run the application
 CMD ["python", "ai_assistant.py"]

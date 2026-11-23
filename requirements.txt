@@ -4,3 +4,4 @@ openwakeword
 google-genai
 numpy
 requests
+pydub

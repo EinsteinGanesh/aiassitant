@@ -7,6 +7,25 @@ venv/
 # Local recordings, generated audio, and conversation history
 *.wav
 *.mp3
+*.m4a
 *.db
 *.sqlite
 *.sqlite3
+
+# Authentication cookies (never commit!)
+cookies.txt
+
+# Temporary audio files
+current_song.*
+temp_audio.*
+youtube_audio.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
