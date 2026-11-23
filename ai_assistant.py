@@ -599,7 +599,7 @@ def build_system_instruction():
 {memories}
 """
 
-async def live_audio_session(initial_greeting=False, nudge_reason=None):
+async def live_audio_session(initial_greeting=False, nudge_reason=None, single_turn=False):
     global is_music_playing, current_song_query, music_wf, ai_audio_queue, global_volume, ai_is_speaking
 
     jarvis_tools = types.Tool(function_declarations=[
@@ -673,6 +673,9 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
 
                 oww_model.reset()
 
+                # Track if we've completed the initial turn (for single_turn mode)
+                initial_turn_complete = not single_turn
+
                 async def send_mic_loop():
                     chunk_count = 0
                     NOISE_THRESHOLD = 800
@@ -707,6 +710,7 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
                         print(f"❌ [MIC SEND ERROR] {e}")
 
                 async def receive_ai_loop():
+                    nonlocal initial_turn_complete
                     global current_song_query, global_volume, ai_is_speaking
                     user_transcript_buf = []
                     ai_transcript_buf = []
@@ -767,6 +771,12 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
 
                                         update_esp32_screen("LIS")
                                         print("✅ [LISTENING] Turn complete. Waiting for your reply... (Session stays open!)")
+
+                                        # For single_turn mode (startup greeting), exit after first turn
+                                        if single_turn and not initial_turn_complete:
+                                            initial_turn_complete = True
+                                            print("🎯 Initial greeting turn complete - returning to main loop for wake detection")
+                                            return
                     except asyncio.CancelledError: pass
                     except Exception as e:
                         print(f"❌ [AI RECEIVE ERROR] {e}")
@@ -780,6 +790,12 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None):
                         while not ai_audio_queue.empty(): ai_audio_queue.get_nowait()
                         await ai_audio_queue.put(b"")
                         ai_is_speaking = False
+                        send_task.cancel(); recv_task.cancel()
+                        user_ended_call = True
+                        break
+
+                    # For single_turn mode, exit after initial turn completes
+                    if single_turn and initial_turn_complete:
                         send_task.cancel(); recv_task.cancel()
                         user_ended_call = True
                         break
@@ -846,12 +862,12 @@ async def main():
     while active_websocket is None: await asyncio.sleep(0.1)
     print("✅ ESP32 connected - Starting assistant...")
 
-    # STARTUP WAKE: Auto-greet when ESP32 connects
+    # STARTUP WAKE: Auto-greet when ESP32 connects (single turn, then return to main loop for wake detection)
     if STARTUP_WAKE_ENABLED:
         print("🎯 Startup wake triggered - Auto-greeting...")
-        await live_audio_session(initial_greeting=True)
+        await live_audio_session(initial_greeting=True, single_turn=True)
     else:
-        await live_audio_session(initial_greeting=True)
+        await live_audio_session(initial_greeting=True, single_turn=True)
 
     wake_buffer = bytearray()
 
