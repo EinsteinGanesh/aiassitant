@@ -26,8 +26,58 @@ client = genai.Client(api_key=API_KEY)
 LIVE_MODEL = "gemini-3.8-live" # அதிவேக ரெஸ்பான்ஸிற்காக 2.0 Flash பயன்படுத்தப்பட்டுள்ளது
 
 print("[SYSTEM] Loading offline 'Hey Jarvis' model...")
-openwakeword.utils.download_models(["hey_jarvis"])
-oww_model = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+# Initialize oww_model as None - will be set by successful initialization
+oww_model = None
+
+# openwakeword version compatibility: try different download methods
+try:
+    # Newer versions (0.6.0+)
+    from openwakeword.utils import download_models
+    download_models(["hey_jarvis"])
+except (ImportError, AttributeError):
+    try:
+        # Older versions
+        import openwakeword
+        openwakeword.utils.download_models(["hey_jarvis"])
+    except (ImportError, AttributeError):
+        try:
+            # Alternative: download via openwakeword's model downloader
+            from openwakeword import utils as oww_utils
+            oww_utils.download_models(["hey_jarvis"])
+        except (ImportError, AttributeError):
+            # Last resort: try direct download using wget/curl
+            import subprocess
+            import os
+            model_dir = os.path.expanduser("~/.local/share/openwakeword")
+            os.makedirs(model_dir, exist_ok=True)
+            model_url = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/hey_jarvis_v0.1.onnx"
+            model_path = os.path.join(model_dir, "hey_jarvis_v0.1.onnx")
+            if not os.path.exists(model_path):
+                print(f"⬇️ Downloading hey_jarvis model manually...")
+                try:
+                    subprocess.run(["wget", "-q", "-O", model_path, model_url], check=True, timeout=60)
+                except:
+                    try:
+                        subprocess.run(["curl", "-sL", "-o", model_path, model_url], check=True, timeout=60)
+                    except Exception as e:
+                        print(f"⚠️ Could not download model: {e}")
+                        print("⚠️ Falling back to text-only wake detection")
+
+# Now try to create the model if we got this far
+if oww_model is None:
+    try:
+        oww_model = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+        print("✅ 'Hey Jarvis' model loaded successfully")
+    except Exception as e:
+        print(f"⚠️ Could not load model: {e}")
+        print("⚠️ Wake word detection disabled - use button press to wake")
+        # Create a dummy model that always returns False
+        class DummyOWWModel:
+            def predict(self, x):
+                return {"hey_jarvis": 0.0}
+            def reset(self):
+                pass
+        oww_model = DummyOWWModel()
 
 # ஆரம்ப வால்யூம் 20% (0.0 முதல் 1.0 வரை)
 global_volume = 0.2
