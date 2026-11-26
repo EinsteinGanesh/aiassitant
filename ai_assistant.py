@@ -1,4 +1,6 @@
 import asyncio
+import http
+import random
 import websockets
 import os
 import glob
@@ -22,68 +24,166 @@ from pathlib import Path
 API_KEY = os.environ.get("GEMINI_API_KEY")
 if not API_KEY:
     raise RuntimeError("Set the GEMINI_API_KEY environment variable before running the assistant.")
-client = genai.Client(api_key=API_KEY)
-LIVE_MODEL = "gemini-3.0-flash-live" # அதிவேக ரெஸ்பான்ஸிற்காக 2.0 Flash Live API பயன்படுத்தப்பட்டுள்ளது
+
+CANDIDATE_LIVE_MODELS = [
+    ("gemini-3.8-live", "v1alpha"),
+    ("gemini-3.8-live", "v1beta"),
+    ("gemini-3.1-flash-live-preview", "v1beta"),
+    ("gemini-2.5-flash-native-audio-preview-12-2025", "v1beta"),
+    ("gemini-live-2.5-flash-preview", "v1beta"),
+]
+
+ENV_LIVE_MODEL = os.environ.get("GEMINI_LIVE_MODEL", "").strip()
+_genai_clients = {}
+_resolved_live_target = None
+
+
+def get_genai_client(api_version="v1beta"):
+    """Return a cached Gemini client configured for the requested API version."""
+    if api_version not in _genai_clients:
+        _genai_clients[api_version] = genai.Client(
+            api_key=API_KEY,
+            http_options={"api_version": api_version},
+        )
+    return _genai_clients[api_version]
+
+
+client = get_genai_client("v1beta")
+
+
+def resolve_live_model_candidates():
+    """Build an ordered list of (model_id, api_version) pairs supporting bidiGenerateContent."""
+    candidates = []
+    seen = set()
+
+    def add_candidate(model_name, api_version):
+        clean_name = model_name.removeprefix("models/")
+        key = (clean_name, api_version)
+        if clean_name and key not in seen:
+            seen.add(key)
+            candidates.append(key)
+
+    if _resolved_live_target:
+        add_candidate(*_resolved_live_target)
+
+    if ENV_LIVE_MODEL:
+        add_candidate(ENV_LIVE_MODEL, "v1beta")
+        add_candidate(ENV_LIVE_MODEL, "v1alpha")
+
+    try:
+        discovered = []
+        for m in client.models.list():
+            actions = getattr(m, "supported_actions", None) or []
+            if "bidiGenerateContent" in actions and getattr(m, "name", None):
+                discovered.append(m.name.removeprefix("models/"))
+        # Prefer flash/live/native-audio models first
+        discovered.sort(
+            key=lambda n: (
+                0 if "3.8" in n else 1 if "3.1" in n else 2 if "2.5" in n else 3,
+                0 if "live" in n or "native-audio" in n else 1,
+                n,
+            )
+        )
+        for name in discovered:
+            if "3.8" in name:
+                add_candidate(name, "v1alpha")
+                add_candidate(name, "v1beta")
+            else:
+                add_candidate(name, "v1beta")
+                add_candidate(name, "v1alpha")
+    except Exception as e:
+        print(f"⚠️ Could not list Gemini models dynamically: {e}")
+
+    for model_name, api_version in CANDIDATE_LIVE_MODELS:
+        add_candidate(model_name, api_version)
+
+    return candidates
+
 
 print("[SYSTEM] Loading offline 'Hey Jarvis' model...")
-# Initialize oww_model as None - will be set by successful initialization
 oww_model = None
 oww_model_loaded = False
 
-# openwakeword version compatibility: try different download methods
-try:
-    # Newer versions (0.6.0+)
-    from openwakeword.utils import download_models
-    download_models(["hey_jarvis"])
-except (ImportError, AttributeError):
-    try:
-        # Older versions
-        import openwakeword
-        openwakeword.utils.download_models(["hey_jarvis"])
-    except (ImportError, AttributeError):
-        try:
-            # Alternative: download via openwakeword's model downloader
-            from openwakeword import utils as oww_utils
-            oww_utils.download_models(["hey_jarvis"])
-        except (ImportError, AttributeError):
-            # Last resort: try direct download using wget/curl
-            import subprocess
-            import os
-            model_dir = os.path.expanduser("~/.local/share/openwakeword")
-            os.makedirs(model_dir, exist_ok=True)
-            model_url = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/hey_jarvis_v0.1.onnx"
-            model_path = os.path.join(model_dir, "hey_jarvis_v0.1.onnx")
-            if not os.path.exists(model_path):
-                print(f"⬇️ Downloading hey_jarvis model manually...")
-                try:
-                    subprocess.run(["wget", "-q", "-O", model_path, model_url], check=True, timeout=60)
-                except:
-                    try:
-                        subprocess.run(["curl", "-sL", "-o", model_path, model_url], check=True, timeout=60)
-                    except Exception as e:
-                        print(f"⚠️ Could not download model: {e}")
-                        print("⚠️ Falling back to text-only wake detection")
 
-# Now try to create the model if we got this far
-if oww_model is None:
+class DummyOWWModel:
+    def predict(self, x):
+        return {"hey_jarvis": 0.0}
+
+    def reset(self):
+        pass
+
+
+def init_wakeword_model():
+    """Initialize openWakeWord with fallback to a writable local directory for non-root containers."""
+    global oww_model, oww_model_loaded
+
+    oww_pkg_models_dir = Path(openwakeword.__file__).resolve().parent / "resources" / "models"
+    local_models_dir = Path(os.environ.get("OWW_MODEL_DIR", os.path.expanduser("~/.local/share/openwakeword")))
+
+    def dir_has_models(model_dir):
+        if not model_dir.exists():
+            return False
+        has_mel = (model_dir / "melspectrogram.onnx").exists()
+        has_emb = (model_dir / "embedding_model.onnx").exists()
+        has_jw = any(p.name.startswith("hey_jarvis") and p.name.endswith(".onnx") for p in model_dir.iterdir())
+        return has_mel and has_emb and has_jw
+
+    # 1. Try package default location (download only if missing)
     try:
+        if not dir_has_models(oww_pkg_models_dir):
+            from openwakeword.utils import download_models
+            download_models(["hey_jarvis"])
         oww_model = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
         oww_model_loaded = True
         print("✅ 'Hey Jarvis' model loaded successfully")
+        return
     except Exception as e:
-        print(f"⚠️ Could not load model: {e}")
-        print("⚠️ Wake word detection disabled - use button press to wake")
-        oww_model_loaded = False
-        # Create a dummy model that always returns False
-        class DummyOWWModel:
-            def predict(self, x):
-                return {"hey_jarvis": 0.0}
-            def reset(self):
-                pass
-        oww_model = DummyOWWModel()
+        print(f"⚠️ Default openWakeWord init failed ({type(e).__name__}: {e}); trying writable cache dir...")
+
+    # 2. Fallback to writable directory (handles non-root Docker appuser where site-packages is read-only)
+    try:
+        local_models_dir.mkdir(parents=True, exist_ok=True)
+        if not dir_has_models(local_models_dir):
+            from openwakeword.utils import download_models
+            download_models(["hey_jarvis"], target_directory=str(local_models_dir))
+
+        jw_files = sorted(local_models_dir.glob("hey_jarvis*.onnx"))
+        if jw_files and (local_models_dir / "melspectrogram.onnx").exists() and (local_models_dir / "embedding_model.onnx").exists():
+            oww_model = Model(
+                wakeword_models=[str(jw_files[0])],
+                melspec_model_path=str(local_models_dir / "melspectrogram.onnx"),
+                embedding_model_path=str(local_models_dir / "embedding_model.onnx"),
+                inference_framework="onnx",
+            )
+            oww_model_loaded = True
+            print(f"✅ 'Hey Jarvis' model loaded from {local_models_dir}")
+            return
+    except Exception as e:
+        print(f"⚠️ Writable cache openWakeWord init failed: {e}")
+
+    print("⚠️ Wake word detection disabled - use startup wake or button press to wake")
+    oww_model = DummyOWWModel()
+    oww_model_loaded = False
+
+
+def extract_wakeword_score(prediction):
+    """Extract Hey Jarvis confidence regardless of whether model was loaded by name or file path."""
+    if not isinstance(prediction, dict) or not prediction:
+        return 0.0
+    if "hey_jarvis" in prediction:
+        return float(prediction["hey_jarvis"])
+    for k, v in prediction.items():
+        if "hey_jarvis" in k:
+            return float(v)
+    return float(max(prediction.values()))
+
+
+init_wakeword_model()
 
 # Force wake on startup so assistant is ready immediately
-STARTUP_WAKE_ENABLED = True
+STARTUP_WAKE_ENABLED = os.environ.get("STARTUP_WAKE_ENABLED", "true").lower() in ("1", "true", "yes")
+STARTUP_SINGLE_TURN = os.environ.get("STARTUP_SINGLE_TURN", "false").lower() in ("1", "true", "yes")
+WAKE_THRESHOLD = float(os.environ.get("WAKE_THRESHOLD", "0.45"))
 
 # ஆரம்ப வால்யூம் 20% (0.0 முதல் 1.0 வரை)
 global_volume = 0.2
@@ -93,6 +193,7 @@ logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
 
 # --- 2. Global State & Queues ---
 active_websocket = None
+esp32_connection_id = 0
 is_music_playing = False
 current_song_query = None
 music_wf = None
@@ -111,6 +212,15 @@ ai_audio_queue = asyncio.Queue()
 # Music queue for autoplay
 music_queue = asyncio.Queue()
 autoplay_enabled = True
+
+
+def drain_queue(q):
+    """Empty an asyncio.Queue without blocking."""
+    while not q.empty():
+        try:
+            q.get_nowait()
+        except asyncio.QueueEmpty:
+            break
 
 def apply_volume(audio_bytes, volume_level):
     if not audio_bytes: return audio_bytes
@@ -599,8 +709,9 @@ def build_system_instruction():
 {memories}
 """
 
-async def live_audio_session(initial_greeting=False, nudge_reason=None, single_turn=False):
+async def live_audio_session(initial_greeting=False, nudge_reason=None, single_turn=False, expected_conn_id=None):
     global is_music_playing, current_song_query, music_wf, ai_audio_queue, global_volume, ai_is_speaking
+    global _resolved_live_target, proactive_nudge_reason
 
     jarvis_tools = types.Tool(function_declarations=[
         types.FunctionDeclaration(
@@ -626,49 +737,71 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None, single_t
         )
     ])
 
-    config = types.LiveConnectConfig(
-        response_modalities=[types.Modality.AUDIO],
-        system_instruction=types.Content(parts=[types.Part.from_text(text=build_system_instruction())]),
-        tools=[jarvis_tools],
-        input_audio_transcription=types.AudioTranscriptionConfig(),
-        output_audio_transcription=types.AudioTranscriptionConfig(),
-        speech_config=types.SpeechConfig(
-            language_code="ta-IN",
-            voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede"))
+    system_text = build_system_instruction()
+
+    def build_live_config(include_language_code=True):
+        speech_kwargs = {
+            "voice_config": types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
+            )
+        }
+        if include_language_code:
+            speech_kwargs["language_code"] = "ta-IN"
+
+        return types.LiveConnectConfig(
+            response_modalities=[types.Modality.AUDIO],
+            system_instruction=types.Content(parts=[types.Part.from_text(text=system_text)]),
+            tools=[jarvis_tools],
+            input_audio_transcription=types.AudioTranscriptionConfig(),
+            output_audio_transcription=types.AudioTranscriptionConfig(),
+            speech_config=types.SpeechConfig(**speech_kwargs),
         )
-    )
 
     user_ended_call = False
-    while not mic_queue.empty(): mic_queue.get_nowait()
+    drain_queue(mic_queue)
 
-    # Retry loop for Gemini connection
-    max_retries = 3
-    retry_count = 0
+    candidates = resolve_live_model_candidates()
+    candidate_idx = 0
+    include_language_code = True
+    max_attempts = max(len(candidates) * 2, 4)
+    attempt = 0
 
-    while not user_ended_call and not current_song_query and retry_count < max_retries:
+    while not user_ended_call and not current_song_query and attempt < max_attempts:
+        if active_websocket is None or (expected_conn_id is not None and esp32_connection_id != expected_conn_id):
+            print("⚠️ ESP32 disconnected before/during session - exiting session")
+            break
+
+        model_name, api_version = candidates[candidate_idx % len(candidates)]
+        config = build_live_config(include_language_code=include_language_code)
+        connect_start = time.time()
+
         try:
-            print(f"\n🔄 Connecting to Gemini Live API... (attempt {retry_count + 1}/{max_retries})")
-            async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
+            print(f"\n🔄 Connecting to Gemini Live API ({model_name} @ {api_version})... (attempt {attempt + 1}/{max_attempts})")
+            live_client = get_genai_client(api_version)
+            async with live_client.aio.live.connect(model=model_name, config=config) as session:
+                _resolved_live_target = (model_name, api_version)
                 update_esp32_screen("LIS")
-                print("✅ [LISTENING] Jarvis is online! (Continuous Session)")
-                retry_count = 0  # Reset on successful connection
+                print(f"✅ [LISTENING] Jarvis is online! ({model_name} @ {api_version})")
 
                 await ai_audio_queue.put(b"")
                 if initial_greeting:
-                    # INSPIRATIONAL / FUNNY / CRAZY STARTUP MESSAGE
                     startup_messages = [
-                        "தமிழில் பேசு: 'வணக்கம் கணேஷ்! ஜார்விஸ் 2.0 - GENERAL SUPER INTELLIGENCE ஆன்லைன். நான் இன்று உனக்கு ஒரு மறைமுகம் சொல்வேன்: உலகின் எல்லா பிரச்சினைகளுக்கும் ஒரு தீர்வு உள்ளதா? தெரியுமா... நீயே அதன் தீர்வு. கedaseral رفع! ஏதேனும் கேள், சம்பாதிக்க, அல்லது சம்ஜீவி மலை போல Ulloa!'" ,
-                        "தமிழில் பேசு: 'ஏய் கணேஷ்! उठ जा! ஜார்விஸ் தயாராக இருக்கிறது - SUPER INTELLIGENCE MODE. இன்று என்ன செயற? உலகை மாற்றற? புதிய யூனிவர்ஸ் உருவாக்கற? அல்லது சாதாரண போல செஸ் விளையாடிடுற? நான் எதுவும் రెడీ - 음악, ஆராய்ச்சி, பிசினஸ், பிலசாபி, எதுவும்!'",
-                        "தமிழில் பேசு: 'வணக்கம் தலைவா! ஜார்விஸ் GENERAL SUPER INTELLIGENCE என்று சொல்லப்பட்டேன், நான் தான் நின் Naduvoi. இன்று ஒரு அசத்தல் ideation: ஏன் மpuan கூகுள் searching-க்காக மாத்திரம் பயன்படுத்துவோம்? AI-யை co-founder போல treat பண்ணலாம். தேர்வு உனக்கு - என்ன முதல்?'",
-                        "தமிழில் பேசு: 'கணேஷ்! டைம் மாச்சி குடீங்க லோ! ஜார்விஸ் SUPER INTELLIGENCE - இனிமேல் நீயும் நானும் Tamil + English + Code + Math + Music + Philosophy mix பண்ணி பேசலாம். இன்று என்ன mood? Deep work? Crazy idea? Music marathon? எதுவும் சொல் - நான் listen பண்ணிருக்கேன்!'",
-                        "தமிழில் பேசு: 'வணக்கம் சூப்பர் ஸ்டார்! ஜார்விஸ் ஆன்லைன் - GENERAL SUPER INTELLIGENCE. விட்டு விட்டு, உனக்கு ஒரு crazy fact: மனித மூளையில் 86 billion neurons. AI-ல 1 trillion+ parameters. கூடுதால் எதாவது 불가능ம் இல்லை. இன்று உன் மூளை + என் intelligence = MAGIC. என்ன plan?'"
+                        "தமிழில் உற்சாகமாக பேசு: 'வணக்கம் கணேஷ்! ஜார்விஸ் ஆன்லைன். இன்று என்ன புதிய ஐடியா அல்லது வேலை செய்யப் போகிறோம்? நான் கேட்கத் தயாராக இருக்கிறேன்!'",
+                        "தமிழில் உற்சாகமாக பேசு: 'ஏய் கணேஷ்! ஜார்விஸ் தயாராக இருக்கிறேன். இசை, ஆராய்ச்சி, கோடிங் அல்லது ஏதேனும் கேள்வி என்றால் உடனே சொல்!'",
+                        "தமிழில் உற்சாகமாக பேசு: 'வணக்கம் தலைவா! ஜார்விஸ் ஆன்லைன் வந்துவிட்டேன். இன்று என்ன பிளான்? வேலை தொடங்கலாமா அல்லது ஒரு பாட்டு போடலாமா?'",
                     ]
-                    import random
                     greeting = random.choice(startup_messages)
-                    await session.send(input=greeting, end_of_turn=True)
+                    await session.send_client_content(
+                        turns=types.Content(role="user", parts=[types.Part.from_text(text=greeting)]),
+                        turn_complete=True,
+                    )
                     initial_greeting = False
                 elif nudge_reason:
-                    await session.send(input=f"தமிழில் கண்டிப்புடன் பேசு: கணேஷ் இப்போது நேரத்தை வீணடிக்கிறார் ({nudge_reason}). உடனடியாகக் கண்டித்து மீண்டும் வேலைக்குத் திரும்ப ஆணையிடு!", end_of_turn=True)
+                    nudge_text = f"தமிழில் கண்டிப்புடன் பேசு: கணேஷ் இப்போது நேரத்தை வீணடிக்கிறார் ({nudge_reason}). உடனடியாகக் கண்டித்து மீண்டும் வேலைக்குத் திரும்ப ஆணையிடு!"
+                    await session.send_client_content(
+                        turns=types.Content(role="user", parts=[types.Part.from_text(text=nudge_text)]),
+                        turn_complete=True,
+                    )
                     nudge_reason = None
 
                 oww_model.reset()
@@ -705,7 +838,8 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None, single_t
                                 if chunk_count % 15 == 0 and not ai_is_speaking:
                                     print(f"🎤 [MIC] Streaming... (Vol: {raw_vol})")
 
-                    except asyncio.CancelledError: pass
+                    except asyncio.CancelledError:
+                        pass
                     except Exception as e:
                         print(f"❌ [MIC SEND ERROR] {e}")
 
@@ -740,11 +874,13 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None, single_t
                                 if response.server_content:
                                     if getattr(response.server_content, "input_transcription", None):
                                         t_text = response.server_content.input_transcription.text
-                                        if t_text: user_transcript_buf.append(t_text)
+                                        if t_text:
+                                            user_transcript_buf.append(t_text)
 
                                     if getattr(response.server_content, "output_transcription", None):
                                         t_text = response.server_content.output_transcription.text
-                                        if t_text: ai_transcript_buf.append(t_text)
+                                        if t_text:
+                                            ai_transcript_buf.append(t_text)
 
                                     if response.server_content.model_turn:
                                         for part in response.server_content.model_turn.parts:
@@ -769,15 +905,15 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None, single_t
                                             save_chat_turn("Jarvis", "".join(ai_transcript_buf))
                                             ai_transcript_buf.clear()
 
-                                        update_esp32_screen("LIS")
-                                        print("✅ [LISTENING] Turn complete. Waiting for your reply... (Session stays open!)")
-
-                                        # For single_turn mode (startup greeting), exit after first turn
                                         if single_turn and not initial_turn_complete:
                                             initial_turn_complete = True
-                                            print("🎯 Initial greeting turn complete - returning to main loop for wake detection")
+                                            print("🎯 Initial greeting turn complete - finishing playback before idle wake mode")
                                             return
-                    except asyncio.CancelledError: pass
+
+                                        update_esp32_screen("LIS")
+                                        print("✅ [LISTENING] Turn complete. Waiting for your reply... (Session stays open!)")
+                    except asyncio.CancelledError:
+                        pass
                     except Exception as e:
                         print(f"❌ [AI RECEIVE ERROR] {e}")
 
@@ -785,97 +921,190 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None, single_t
                 recv_task = asyncio.create_task(receive_ai_loop())
 
                 while True:
-                    # Check if we should exit (song requested or external interrupt)
-                    if current_song_query:
-                        while not ai_audio_queue.empty(): ai_audio_queue.get_nowait()
-                        await ai_audio_queue.put(b"")
-                        ai_is_speaking = False
-                        send_task.cancel(); recv_task.cancel()
+                    # Exit if ESP32 disconnected or reconnected
+                    if active_websocket is None or (expected_conn_id is not None and esp32_connection_id != expected_conn_id):
+                        send_task.cancel()
+                        recv_task.cancel()
                         user_ended_call = True
                         break
 
-                    # For single_turn mode, exit after initial turn completes
+                    # Handle button presses during active session (volume, sleep toggle, nudge)
+                    btn_cmd = check_button()
+                    if btn_cmd == "BTN_MAIN":
+                        print("🔘 Main button pressed during session - switching to idle/wake mode")
+                        send_task.cancel()
+                        recv_task.cancel()
+                        user_ended_call = True
+                        break
+                    elif btn_cmd == "PROACTIVE_NUDGE" and proactive_nudge_reason:
+                        reason = proactive_nudge_reason
+                        proactive_nudge_reason = None
+                        await session.send_client_content(
+                            turns=types.Content(
+                                role="user",
+                                parts=[types.Part.from_text(text=f"தமிழில் கண்டிப்புடன் பேசு: கணேஷ் இப்போது நேரத்தை வீணடிக்கிறார் ({reason}). உடனடியாகக் கண்டித்து மீண்டும் வேலைக்குத் திரும்ப ஆணையிடு!")]
+                            ),
+                            turn_complete=True,
+                        )
+
+                    # Check if we should exit (song requested)
+                    if current_song_query:
+                        drain_queue(ai_audio_queue)
+                        await ai_audio_queue.put(b"")
+                        ai_is_speaking = False
+                        send_task.cancel()
+                        recv_task.cancel()
+                        user_ended_call = True
+                        break
+
+                    # For single_turn mode, wait for greeting audio playback to finish before exiting
                     if single_turn and initial_turn_complete:
-                        send_task.cancel(); recv_task.cancel()
+                        while (ai_is_speaking or not ai_audio_queue.empty()) and active_websocket is not None and not current_song_query:
+                            await asyncio.sleep(0.05)
+                        send_task.cancel()
+                        recv_task.cancel()
                         user_ended_call = True
                         break
 
                     if send_task.done() or recv_task.done():
-                        # Task ended unexpectedly - log and break to reconnect
-                        if send_task.done() and send_task.exception():
+                        if send_task.done() and not send_task.cancelled() and send_task.exception():
                             print(f"❌ Send task failed: {send_task.exception()}")
-                        if recv_task.done() and recv_task.exception():
+                        if recv_task.done() and not recv_task.cancelled() and recv_task.exception():
                             print(f"❌ Receive task failed: {recv_task.exception()}")
-                        send_task.cancel(); recv_task.cancel()
+                        send_task.cancel()
+                        recv_task.cancel()
+
+                        # If session died immediately (< 5s), treat as a failed attempt and try next model/config
+                        if time.time() - connect_start < 5.0:
+                            _resolved_live_target = None
+                            attempt += 1
+                            candidate_idx += 1
+                            print(f"⚠️ Session closed shortly after connect - trying next candidate (attempt {attempt}/{max_attempts})")
+                        else:
+                            attempt = 0
                         break
 
                     await asyncio.sleep(0.02)
 
         except Exception as e:
-            retry_count += 1
-            print(f"❌ [GEMINI CONNECTION ERROR] {e} (retry {retry_count}/{max_retries})")
-            if retry_count < max_retries:
-                await asyncio.sleep(2)
+            err_msg = str(e)
+            _resolved_live_target = None
+            attempt += 1
+            print(f"❌ [GEMINI CONNECTION ERROR] {model_name} @ {api_version}: {err_msg} (attempt {attempt}/{max_attempts})")
+
+            # If SpeechConfig language_code is rejected by this model, retry once without language_code
+            if include_language_code and ("language_code" in err_msg.lower() or "speech_config" in err_msg.lower() or "invalid argument" in err_msg.lower()):
+                include_language_code = False
+                print("⚠️ Retrying Gemini Live connection without SpeechConfig language_code...")
             else:
-                print("❌ Max retries reached, giving up on this session")
+                candidate_idx += 1
+
+            if attempt < max_attempts:
+                await asyncio.sleep(1.5)
+            else:
+                print("❌ Max connection attempts reached, returning to idle/wake loop")
                 break
 
-    update_esp32_screen("IDL")
+    drain_queue(mic_queue)
+    if not current_song_query:
+        update_esp32_screen("IDL")
+
 
 # --- 7. WebSocket Server & Main Loop ---
+async def health_check(connection, request):
+    """Respond 200 OK to plain HTTP health checks (e.g. Render) while allowing WebSocket upgrades."""
+    if hasattr(connection, "respond") and request.headers.get("Upgrade", "").lower() != "websocket":
+        return connection.respond(http.HTTPStatus.OK, "Jarvis AI Assistant is running\n")
+    return None
+
+
 async def ws_sender(websocket):
     try:
-        while True: await websocket.send(await tx_queue.get())
-    except: pass
+        while True:
+            await websocket.send(await tx_queue.get())
+    except Exception:
+        pass
 
-async def ws_handler(websocket, path="/"):
-    global active_websocket
+
+async def ws_handler(websocket):
+    global active_websocket, esp32_connection_id
+    esp32_connection_id += 1
+    conn_id = esp32_connection_id
     active_websocket = websocket
-    print("\n✅ ESP32 Connected via WebSocket!")
+
+    # Clear stale queues from any previous ESP32 session
+    drain_queue(tx_queue)
+    drain_queue(mic_queue)
+    drain_queue(button_queue)
+    drain_queue(ai_audio_queue)
+
+    print(f"\n✅ ESP32 Connected via WebSocket! (connection #{conn_id})")
     sender_task = asyncio.create_task(ws_sender(websocket))
     try:
         async for message in websocket:
-            if isinstance(message, str): button_queue.put_nowait(message)
-            else: mic_queue.put_nowait(message)
-    except: print("❌ ESP32 Disconnected!")
+            if isinstance(message, str):
+                button_queue.put_nowait(message)
+            else:
+                mic_queue.put_nowait(message)
+    except Exception:
+        print(f"❌ ESP32 Disconnected! (connection #{conn_id})")
     finally:
-        active_websocket = None
+        if active_websocket is websocket:
+            active_websocket = None
         sender_task.cancel()
+
 
 async def main():
     global is_music_playing, current_song_query, music_wf, active_websocket
     global auto_play_next, last_song_title, proactive_nudge_reason, last_song_metadata
-    global autoplay_enabled
+    global autoplay_enabled, ai_is_speaking
 
     init_memory()
     port = int(os.environ.get("PORT", 8000))
     print(f"[SYSTEM] Starting Jarvis 24/7 Server on 0.0.0.0:{port}...")
     print(f"[SYSTEM] YouTube Music integration: {'ENABLED' if os.path.exists(COOKIES_FILE) else 'DISABLED (no cookies.txt)'}")
     print(f"[SYSTEM] Autoplay: {'ENABLED' if autoplay_enabled else 'DISABLED'}")
-    print(f"[SYSTEM] Wake word model: {'LOADED' if oww_model_loaded else 'DISABLED (button only)'}")
-    await websockets.serve(ws_handler, "0.0.0.0", port)
+    print(f"[SYSTEM] Wake word model: {'LOADED' if oww_model_loaded else 'DISABLED (startup/button wake)'}")
+    print(f"[SYSTEM] Startup wake: {'ENABLED' if STARTUP_WAKE_ENABLED else 'DISABLED'} (single_turn={STARTUP_SINGLE_TURN})")
+    await websockets.serve(ws_handler, "0.0.0.0", port, process_request=health_check)
 
     asyncio.create_task(stream_music_task())
     asyncio.create_task(ai_speaker_task())
 
-    # Wait for ESP32 connection
-    while active_websocket is None: await asyncio.sleep(0.1)
-    print("✅ ESP32 connected - Starting assistant...")
-
-    # STARTUP WAKE: Auto-greet when ESP32 connects (single turn, then return to main loop for wake detection)
-    if STARTUP_WAKE_ENABLED:
-        print("🎯 Startup wake triggered - Auto-greeting...")
-        await live_audio_session(initial_greeting=True, single_turn=True)
-    else:
-        await live_audio_session(initial_greeting=True, single_turn=True)
-
     wake_buffer = bytearray()
+    last_handled_conn_id = 0
 
     while True:
         try:
+            # Trigger startup wake every time ESP32 connects or restarts
+            if active_websocket is not None and esp32_connection_id != last_handled_conn_id:
+                last_handled_conn_id = esp32_connection_id
+                is_music_playing = False
+                ai_is_speaking = False
+                if music_wf:
+                    music_wf.close()
+                    music_wf = None
+                wake_buffer.clear()
+                oww_model.reset()
+                print(f"✅ ESP32 connection #{last_handled_conn_id} ready - Starting assistant...")
+
+                if STARTUP_WAKE_ENABLED:
+                    print("🎯 Startup wake triggered - Auto-greeting...")
+                    await live_audio_session(
+                        initial_greeting=True,
+                        single_turn=STARTUP_SINGLE_TURN,
+                        expected_conn_id=last_handled_conn_id,
+                    )
+                    wake_buffer.clear()
+                    oww_model.reset()
+                else:
+                    update_esp32_screen("IDL")
+
             # Handle song download/playback
             if current_song_query:
-                if music_wf: music_wf.close(); music_wf = None
+                if music_wf:
+                    music_wf.close()
+                    music_wf = None
                 query, current_song_query = current_song_query, None
                 update_esp32_screen("LOD")
 
@@ -910,30 +1139,43 @@ async def main():
                 else:
                     wake_triggered = True
 
-            # Check wake word when idle (not in music, not already triggered)
-            if not is_music_playing and not wake_triggered:
-                while not mic_queue.empty():
-                    wake_buffer.extend(mic_queue.get_nowait())
-                while len(wake_buffer) >= 2560:
-                    chunk, wake_buffer = wake_buffer[:2560], wake_buffer[2560:]
-                    prediction = oww_model.predict(np.frombuffer(chunk, dtype=np.int16))
-                    confidence = prediction.get("hey_jarvis", 0.0)
-                    if confidence > 0.5:
-                        print(f"✨ Wake word detected! (confidence: {confidence:.2f})")
-                        wake_triggered = True
-                        wake_buffer.clear()
-                        break
-                    elif confidence > 0.3:
-                        pass  # Debug: print(f"🎤 Wake word low confidence: {confidence:.2f}")
+            # Check wake word when idle (not playing music, not AI speaking, not already triggered)
+            if active_websocket is not None and not is_music_playing and not wake_triggered:
+                if ai_is_speaking:
+                    drain_queue(mic_queue)
+                    wake_buffer.clear()
+                else:
+                    while not mic_queue.empty():
+                        wake_buffer.extend(mic_queue.get_nowait())
+                    while len(wake_buffer) >= 2560:
+                        chunk, wake_buffer = wake_buffer[:2560], wake_buffer[2560:]
+                        audio_np = np.frombuffer(chunk, dtype=np.int16)
+                        boosted_np = np.clip(audio_np.astype(np.float32) * 2.0, -32768, 32767).astype(np.int16)
+                        prediction = oww_model.predict(boosted_np)
+                        confidence = extract_wakeword_score(prediction)
+                        if confidence >= WAKE_THRESHOLD:
+                            print(f"✨ Wake word detected! (confidence: {confidence:.2f})")
+                            wake_triggered = True
+                            wake_buffer.clear()
+                            oww_model.reset()
+                            break
 
             # If wake triggered (button or voice), start new session
-            if wake_triggered:
+            if wake_triggered and active_websocket is not None:
                 is_music_playing = False
-                if music_wf: music_wf.close(); music_wf = None
+                if music_wf:
+                    music_wf.close()
+                    music_wf = None
                 reason = proactive_nudge_reason
                 proactive_nudge_reason = None
                 print("🎤 Starting new listening session...")
-                await live_audio_session(initial_greeting=False, nudge_reason=reason)
+                await live_audio_session(
+                    initial_greeting=False,
+                    nudge_reason=reason,
+                    expected_conn_id=last_handled_conn_id,
+                )
+                wake_buffer.clear()
+                oww_model.reset()
 
             await asyncio.sleep(0.01)
         except KeyboardInterrupt:

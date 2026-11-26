@@ -1,6 +1,7 @@
-websockets
+websockets>=14.0
 yt-dlp
 openwakeword
+onnxruntime
 google-genai
 numpy
 requests

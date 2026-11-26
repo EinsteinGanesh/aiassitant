@@ -17,6 +17,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 # Install latest yt-dlp with all features for YouTube Music
 RUN pip install --no-cache-dir -U --pre "yt-dlp[default]"
+# Pre-download openwakeword models as root before dropping to appuser
+RUN python -c "from openwakeword.utils import download_models; download_models(['hey_jarvis'])"
 
 # Copy application code
 COPY *.py .
