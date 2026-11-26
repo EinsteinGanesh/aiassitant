@@ -1,4 +1,5 @@
 import asyncio
+import html
 import http
 import random
 import websockets
@@ -330,248 +331,482 @@ def check_button():
             cmd = "PROACTIVE_NUDGE"
     return cmd
 
-# --- YouTube Music Integration using yt-dlp ---
+# --- Multi-Source Music Integration (JioSaavn + SoundCloud + Spotify Metadata + YouTube Music) ---
 COOKIES_FILE = "cookies.txt"
+PREFER_YOUTUBE = os.environ.get("PREFER_YOUTUBE", "false").lower() in ("1", "true", "yes")
+SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
+SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "").strip()
+JIOSAAVN_API_BASE = os.environ.get("JIOSAAVN_API_URL", "https://saavn.sumit.co").rstrip("/")
 
-def get_ydl_opts(output_template="temp_audio.%(ext)s"):
-    """Configure yt-dlp options for YouTube Music with cookies"""
+_yt_cookies_invalid = False
+_spotify_token_cache = {"token": None, "expires_at": 0.0}
+_recent_song_titles = []
+
+
+def _cleanup_temp_audio():
+    for pattern in ["current_song.*", "temp_audio.*", "youtube_audio.*", "sc_audio.*"]:
+        for old in glob.glob(pattern):
+            try:
+                os.remove(old)
+            except Exception:
+                pass
+
+
+def _convert_to_esp32_wav(input_path, output_path="current_song.wav", timeout=30):
+    """Convert any audio file into 16kHz 16-bit mono PCM WAV for ESP32 streaming."""
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+        "-fflags", "+bitexact", output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        print(f"❌ FFmpeg error: {result.stderr}")
+        return False
+    return os.path.exists(output_path) and os.path.getsize(output_path) > 10000
+
+
+def _record_recent_song(title):
+    clean = (title or "").strip().lower()
+    if not clean:
+        return
+    if clean in _recent_song_titles:
+        _recent_song_titles.remove(clean)
+    _recent_song_titles.append(clean)
+    if len(_recent_song_titles) > 15:
+        _recent_song_titles.pop(0)
+
+
+def _get_spotify_access_token():
+    """Fetch and cache Spotify Client Credentials token when credentials are configured."""
+    if not (SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET):
+        return None
+    now = time.time()
+    if _spotify_token_cache["token"] and now < _spotify_token_cache["expires_at"] - 30:
+        return _spotify_token_cache["token"]
+    try:
+        resp = requests.post(
+            "https://accounts.spotify.com/api/token",
+            data={"grant_type": "client_credentials"},
+            auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
+            timeout=6,
+        )
+        if resp.status_code == 200:
+            payload = resp.json()
+            _spotify_token_cache["token"] = payload.get("access_token")
+            _spotify_token_cache["expires_at"] = now + float(payload.get("expires_in", 3600))
+            return _spotify_token_cache["token"]
+    except Exception as e:
+        print(f"⚠️ Spotify auth error: {e}")
+    return None
+
+
+def resolve_spotify_query(query):
+    """Resolve Spotify URLs or optional Spotify API searches into 'Track Artist' text."""
+    q = (query or "").strip()
+    if not q:
+        return q
+
+    # 1. Handle Spotify links via public oEmbed (no API key needed)
+    if "open.spotify.com/" in q:
+        try:
+            r = requests.get("https://open.spotify.com/oembed", params={"url": q}, timeout=6)
+            if r.status_code == 200:
+                title = html.unescape(r.json().get("title", "")).strip()
+                if title:
+                    print(f"🟢 Spotify link resolved: {title}")
+                    return title
+        except Exception as e:
+            print(f"⚠️ Spotify oEmbed resolve failed: {e}")
+
+    # 2. Optional Spotify Web API enrichment when credentials are set
+    token = _get_spotify_access_token()
+    if token:
+        try:
+            r = requests.get(
+                "https://api.spotify.com/v1/search",
+                params={"q": q, "type": "track", "limit": 1},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=6,
+            )
+            if r.status_code == 200:
+                items = r.json().get("tracks", {}).get("items", [])
+                if items:
+                    track = items[0]
+                    name = track.get("name", "")
+                    artists = " ".join(a.get("name", "") for a in track.get("artists", [])[:2]).strip()
+                    resolved = f"{name} {artists}".strip()
+                    if resolved:
+                        print(f"🟢 Spotify metadata match: {resolved}")
+                        return resolved
+        except Exception as e:
+            print(f"⚠️ Spotify search skipped: {e}")
+
+    return q
+
+
+def _extract_jiosaavn_artist(song):
+    artists = song.get("artists", {})
+    if isinstance(artists, dict):
+        primary = artists.get("primary") or []
+        if isinstance(primary, list) and primary:
+            names = [html.unescape(a.get("name", "")) for a in primary[:2] if a.get("name")]
+            if names:
+                return ", ".join(names)
+    primary_artists = song.get("primaryArtists")
+    if isinstance(primary_artists, str) and primary_artists.strip():
+        return html.unescape(primary_artists.strip())
+    return "Unknown"
+
+
+def search_jiosaavn_songs(query, limit=5):
+    """Search JioSaavn via active API endpoints (no cookies or bot gates required)."""
+    endpoints = [
+        f"{JIOSAAVN_API_BASE}/api/search/songs",
+    ]
+    for url in endpoints:
+        try:
+            resp = requests.get(url, params={"query": query, "limit": limit}, timeout=8)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            results = (data.get("data") or {}).get("results") or data.get("results") or []
+            if isinstance(results, list) and results:
+                return results
+        except Exception as e:
+            print(f"⚠️ JioSaavn search error ({url}): {e}")
+    return []
+
+
+def download_jiosaavn_fallback(query):
+    """Search and download audio from JioSaavn (320kbps AAC -> 16kHz mono WAV)."""
+    print(f"🎵 Searching JioSaavn: {query}")
+    results = search_jiosaavn_songs(query, limit=5)
+    if not results:
+        print("❌ Song not found on JioSaavn")
+        return None, None, None
+
+    for song in results:
+        dl_links = song.get("downloadUrl") or []
+        if not isinstance(dl_links, list) or not dl_links:
+            continue
+        stream_url = dl_links[-1].get("url") or dl_links[-1].get("link")
+        if not stream_url:
+            continue
+
+        title = html.unescape(song.get("name") or song.get("title") or query)
+        artist = _extract_jiosaavn_artist(song)
+        song_id = song.get("id", "")
+        duration = song.get("duration") or 0
+
+        try:
+            print(f"⬇️ Downloading from JioSaavn: {title} - {artist}")
+            audio_resp = requests.get(stream_url, timeout=20)
+            audio_resp.raise_for_status()
+            with open("temp_audio.m4a", "wb") as f:
+                f.write(audio_resp.content)
+
+            print("🔄 Converting to ESP32 WAV format (16kHz Mono)...")
+            ok = _convert_to_esp32_wav("temp_audio.m4a", "current_song.wav", timeout=25)
+            try:
+                os.remove("temp_audio.m4a")
+            except Exception:
+                pass
+
+            if ok:
+                metadata = {
+                    "title": title,
+                    "artist": artist,
+                    "song_id": song_id,
+                    "duration": duration,
+                    "source": "jiosaavn",
+                }
+                _record_recent_song(title)
+                print(f"✅ Ready (JioSaavn): {title} ({os.path.getsize('current_song.wav')} bytes)")
+                return "current_song.wav", title, metadata
+        except Exception as e:
+            print(f"⚠️ JioSaavn track download failed ({title}): {e}")
+            try:
+                if os.path.exists("temp_audio.m4a"):
+                    os.remove("temp_audio.m4a")
+            except Exception:
+                pass
+
+    return None, None, None
+
+
+def search_soundcloud_music(query, max_results=5):
+    """Search SoundCloud via yt-dlp without cookies."""
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": "in_playlist",
+        "noplaylist": True,
+        "socket_timeout": 15,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            result = ydl.extract_info(f"scsearch{max_results}:{query}", download=False)
+            if result and "entries" in result:
+                return [e for e in result["entries"] if e]
+    except Exception as e:
+        print(f"⚠️ SoundCloud search error: {e}")
+    return []
+
+
+def download_soundcloud_song(query):
+    """Search and download public audio from SoundCloud via yt-dlp (no cookies needed)."""
+    print(f"🟠 Searching SoundCloud: {query}")
+    entries = search_soundcloud_music(query, max_results=4)
+    if not entries:
+        print("❌ No results found on SoundCloud")
+        return None, None, None
+
+    # Prefer full tracks (>45s) over 30s Go+ previews when possible
+    ordered = sorted(entries, key=lambda e: 0 if (e.get("duration") or 0) > 45 else 1)
+
+    for entry in ordered:
+        track_url = entry.get("url") or entry.get("webpage_url")
+        if not track_url:
+            continue
+        title = entry.get("title") or query
+        artist = entry.get("uploader") or "Unknown"
+        duration = entry.get("duration") or 0
+
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": "sc_audio.%(ext)s",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 20,
+            "retries": 2,
+        }
+        try:
+            print(f"⬇️ Downloading from SoundCloud: {title} by {artist}")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([track_url])
+
+            downloaded_files = glob.glob("sc_audio.*")
+            if not downloaded_files:
+                continue
+            downloaded_file = downloaded_files[0]
+
+            print("🔄 Converting to ESP32 WAV format (16kHz Mono)...")
+            ok = _convert_to_esp32_wav(downloaded_file, "current_song.wav", timeout=30)
+            try:
+                os.remove(downloaded_file)
+            except Exception:
+                pass
+
+            if ok:
+                metadata = {
+                    "title": title,
+                    "artist": artist,
+                    "duration": duration,
+                    "source": "soundcloud",
+                }
+                _record_recent_song(title)
+                print(f"✅ Ready (SoundCloud): {title} ({os.path.getsize('current_song.wav')} bytes)")
+                return "current_song.wav", title, metadata
+        except Exception as e:
+            print(f"⚠️ SoundCloud download error ({title}): {e}")
+            for old in glob.glob("sc_audio.*"):
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
+
+    return None, None, None
+
+
+def get_ydl_opts(output_template="temp_audio.%(ext)s", use_cookies=True):
+    """Configure yt-dlp options for YouTube Music."""
     opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio/best',
-        'outtmpl': output_template,
-        'noplaylist': True,
-        'quiet': True,
-        'no_warnings': False,
-        'extractaudio': True,
-        'audioformat': 'm4a',
-        'audioquality': '0',  # Best quality
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'm4a',
-            'preferredquality': '0',
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl": output_template,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "m4a",
+            "preferredquality": "0",
         }],
-        'socket_timeout': 30,
-        'retries': 3,
-        'fragment_retries': 3,
-        'ignoreerrors': False,
-        'no_check_certificate': True,
+        "socket_timeout": 20,
+        "retries": 2,
+        "fragment_retries": 2,
+        "ignoreerrors": False,
     }
 
-    # Add cookies if file exists
-    if os.path.exists(COOKIES_FILE):
-        opts['cookiefile'] = COOKIES_FILE
-        print(f"🍪 Using cookies from {COOKIES_FILE}")
+    if use_cookies and not _yt_cookies_invalid and os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
 
     return opts
 
+
 def search_youtube_music(query, max_results=5):
-    """Search YouTube Music for a song"""
+    """Search YouTube Music for a song."""
+    global _yt_cookies_invalid
     search_query = f"ytsearch{max_results}:{query}"
 
-    ydl_opts = get_ydl_opts()
-    ydl_opts['extract_flat'] = 'in_playlist'
-    ydl_opts['quiet'] = True
+    ydl_opts = get_ydl_opts(use_cookies=True)
+    ydl_opts["extract_flat"] = "in_playlist"
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             result = ydl.extract_info(search_query, download=False)
-            if result and 'entries' in result:
-                entries = [e for e in result['entries'] if e]
-                return entries
+            if result and "entries" in result:
+                return [e for e in result["entries"] if e]
     except Exception as e:
-        print(f"⚠️ YouTube Music search error: {e}")
+        msg = str(e).lower()
+        if "cookies" in msg or "429" in msg or "sign in" in msg:
+            _yt_cookies_invalid = True
+        print(f"⚠️ YouTube Music search skipped: {e}")
     return []
 
-def get_youtube_music_url(video_id):
-    """Get the direct streaming URL for a YouTube Music video"""
-    url = f"https://music.youtube.com/watch?v={video_id}"
 
+def get_youtube_music_url(video_id):
+    """Get the direct streaming URL for a YouTube Music video."""
+    url = f"https://music.youtube.com/watch?v={video_id}"
     ydl_opts = get_ydl_opts()
-    ydl_opts['skip_download'] = True
+    ydl_opts["skip_download"] = True
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            # Get the best audio format URL
-            for fmt in info.get('formats', []):
-                if fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
-                    return fmt.get('url'), info
+            for fmt in info.get("formats", []):
+                if fmt.get("acodec") != "none" and fmt.get("vcodec") == "none":
+                    return fmt.get("url"), info
     except Exception as e:
         print(f"⚠️ Failed to get streaming URL: {e}")
     return None, None
 
-def download_youtube_music_song(query):
-    """
-    Download a song from YouTube Music using yt-dlp with cookies.
-    Returns (wav_file_path, song_title, metadata_dict)
-    """
-    print(f"\n[MUSIC] 🎵 Searching YouTube Music: {query}")
 
-    # Clean up old files
-    for pattern in ["current_song.*", "temp_audio.*", "youtube_audio.*"]:
-        for old in glob.glob(pattern):
-            try: os.remove(old)
-            except: pass
+def _download_youtube_music_direct(query):
+    """Attempt download from YouTube Music via yt-dlp."""
+    global _yt_cookies_invalid
+    print(f"📺 Searching YouTube Music: {query}")
 
     try:
-        # Step 1: Search for the song
         search_results = search_youtube_music(query, max_results=3)
-
         if not search_results:
-            print("❌ No results found on YouTube Music")
             return None, None, None
 
-        # Pick the best result (first one usually)
         best_result = search_results[0]
-        video_id = best_result.get('id') or best_result.get('url', '').split('v=')[-1].split('&')[0]
-        title = best_result.get('title', query)
-        uploader = best_result.get('uploader', 'Unknown')
-        duration = best_result.get('duration', 0)
+        video_id = best_result.get("id") or best_result.get("url", "").split("v=")[-1].split("&")[0]
+        title = best_result.get("title", query)
+        uploader = best_result.get("uploader", "Unknown")
+        duration = best_result.get("duration", 0)
 
-        print(f"🎯 Found: {title} by {uploader} (ID: {video_id})")
-
-        # Step 2: Download the audio
-        print(f"⬇️ Downloading from YouTube Music...")
-
-        ydl_opts = get_ydl_opts("youtube_audio.%(ext)s")
+        print(f"🎯 Found on YouTube: {title} by {uploader} (ID: {video_id})")
+        ydl_opts = get_ydl_opts("youtube_audio.%(ext)s", use_cookies=True)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([f"https://music.youtube.com/watch?v={video_id}"])
 
-        # Find the downloaded file
         downloaded_files = glob.glob("youtube_audio.*")
         if not downloaded_files:
-            print("❌ Download failed - no output file")
             return None, None, None
 
         downloaded_file = downloaded_files[0]
-        print(f"✅ Downloaded: {downloaded_file}")
-
-        # Step 3: Convert to ESP32 WAV format (16kHz Mono)
-        print("🔄 Converting to ESP32 WAV format (16kHz Mono)...")
-        cmd = [
-            "ffmpeg", "-y", "-i", downloaded_file,
-            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-            "-fflags", "+bitexact", "current_song.wav"
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-
-        if result.returncode != 0:
-            print(f"❌ FFmpeg error: {result.stderr}")
-            return None, None, None
-
-        # Cleanup downloaded file
-        try: os.remove(downloaded_file)
-        except: pass
-
-        if os.path.exists("current_song.wav") and os.path.getsize("current_song.wav") > 10000:
-            metadata = {
-                'title': title,
-                'artist': uploader,
-                'video_id': video_id,
-                'duration': duration,
-                'source': 'youtube_music'
-            }
-            print(f"✅ Successfully Ready: {title} ({os.path.getsize('current_song.wav')} bytes)")
-            return "current_song.wav", title, metadata
-        else:
-            print("❌ Conversion failed or empty file!")
-            return None, None, None
-
-    except yt_dlp.utils.DownloadError as e:
-        print(f"❌ yt-dlp Download Error: {e}")
-        # Try fallback to JioSaavn
-        return download_jiosaavn_fallback(query)
-    except subprocess.TimeoutExpired:
-        print("❌ FFmpeg timeout")
-        return None, None, None
-    except Exception as e:
-        print(f"❌ Unexpected error: {type(e).__name__}: {e}")
-        return download_jiosaavn_fallback(query)
-
-def download_jiosaavn_fallback(query):
-    """Fallback to JioSaavn if YouTube Music fails"""
-    print("🔄 Falling back to JioSaavn...")
-
-    saavn_apis = [
-        f"https://saavn.dev/api/search/songs?query={query}",
-        f"https://jiosaavn-api-privatecvc2.vercel.app/search/songs?query={query}",
-        f"https://saavn.me/search/songs?query={query}"
-    ]
-
-    stream_url = None
-    title = query
-
-    for api_url in saavn_apis:
+        ok = _convert_to_esp32_wav(downloaded_file, "current_song.wav", timeout=30)
         try:
-            print(f"🔍 Trying API: {api_url.split('/')[2]}...")
-            resp = requests.get(api_url, timeout=6).json()
+            os.remove(downloaded_file)
+        except Exception:
+            pass
 
-            results = resp.get("data", {}).get("results") or resp.get("results") or resp.get("data")
-            if isinstance(results, list) and len(results) > 0:
-                song = results[0]
-                title = song.get("name") or song.get("title") or query
-                dl_links = song.get("downloadUrl")
-
-                if isinstance(dl_links, list) and len(dl_links) > 0:
-                    stream_url = dl_links[-1].get("url") or dl_links[-1].get("link")
-                    if stream_url:
-                        break
-        except Exception as e:
-            print(f"⚠️ API Skip: {e}")
-
-    if not stream_url:
-        print("❌ Song not found in JioSaavn APIs either!")
-        return None, None, None
-
-    try:
-        print(f"⬇️ Downloading from JioSaavn: {title}")
-        audio_data = requests.get(stream_url, timeout=15).content
-
-        with open("temp_audio.m4a", "wb") as f:
-            f.write(audio_data)
-
-        print("🔄 Converting to ESP32 WAV format (16kHz Mono)...")
-        cmd = [
-            "ffmpeg", "-y", "-i", "temp_audio.m4a",
-            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-            "-fflags", "+bitexact", "current_song.wav"
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
-
-        if os.path.exists("temp_audio.m4a"):
-            os.remove("temp_audio.m4a")
-
-        if os.path.exists("current_song.wav") and os.path.getsize("current_song.wav") > 10000:
+        if ok:
             metadata = {
-                'title': title,
-                'artist': 'Unknown',
-                'source': 'jiosaavn'
+                "title": title,
+                "artist": uploader,
+                "video_id": video_id,
+                "duration": duration,
+                "source": "youtube_music",
             }
-            print(f"✅ Successfully Ready (JioSaavn): {title} ({os.path.getsize('current_song.wav')} bytes)")
+            _record_recent_song(title)
+            print(f"✅ Ready (YouTube Music): {title} ({os.path.getsize('current_song.wav')} bytes)")
             return "current_song.wav", title, metadata
-        else:
-            print("❌ Conversion failed or empty file!")
-            return None, None, None
-
     except Exception as e:
-        print(f"❌ JioSaavn Download/Convert Error: {e}")
-        return None, None, None
+        msg = str(e).lower()
+        if "cookies" in msg or "429" in msg or "sign in" in msg:
+            _yt_cookies_invalid = True
+        print(f"⚠️ YouTube Music unavailable ({e})")
+    return None, None, None
+
+
+def download_youtube_music_song(query):
+    """
+    Download a song using resilient multi-source fallback:
+    Spotify metadata (optional) -> JioSaavn -> SoundCloud -> YouTube Music.
+    Returns (wav_file_path, song_title, metadata_dict).
+    """
+    print(f"\n[MUSIC] 🎵 Resolving song request: {query}")
+    _cleanup_temp_audio()
+
+    resolved_query = resolve_spotify_query(query)
+
+    if PREFER_YOUTUBE:
+        providers = [
+            _download_youtube_music_direct,
+            download_jiosaavn_fallback,
+            download_soundcloud_song,
+        ]
+    else:
+        providers = [
+            download_jiosaavn_fallback,
+            download_soundcloud_song,
+            _download_youtube_music_direct,
+        ]
+
+    for provider in providers:
+        wav_path, title, meta = provider(resolved_query)
+        if wav_path and os.path.exists(wav_path):
+            return wav_path, title, meta
+
+    print("❌ All music sources failed for query:", resolved_query)
+    return None, None, None
+
 
 def get_autoplay_suggestions(current_title, current_artist, count=5):
-    """Get autoplay suggestions from YouTube Music based on current song"""
-    # Build a search query for similar songs
-    search_query = f"{current_title} {current_artist} similar songs mix"
-    results = search_youtube_music(search_query, max_results=count)
-
+    """Get autoplay suggestions across JioSaavn, SoundCloud, and YouTube without repeating recent songs."""
     suggestions = []
-    for r in results:
-        vid = r.get('id') or r.get('url', '').split('v=')[-1].split('&')[0]
-        suggestions.append({
-            'title': r.get('title', 'Unknown'),
-            'artist': r.get('uploader', 'Unknown'),
-            'video_id': vid,
-            'duration': r.get('duration', 0)
-        })
+    seen_titles = set(_recent_song_titles)
+    clean_artist = "" if not current_artist or current_artist == "Unknown" else current_artist.split(",")[0].strip()
+
+    # 1. JioSaavn artist / mood search
+    saavn_queries = [q for q in [clean_artist, f"{current_title} mix", "tamil hits"] if q]
+    for sq in saavn_queries:
+        for song in search_jiosaavn_songs(sq, limit=count + 3):
+            title = html.unescape(song.get("name") or song.get("title") or "").strip()
+            artist = _extract_jiosaavn_artist(song)
+            if title and title.lower() not in seen_titles:
+                seen_titles.add(title.lower())
+                suggestions.append({
+                    "title": title,
+                    "artist": artist,
+                    "song_id": song.get("id", ""),
+                    "duration": song.get("duration", 0),
+                })
+                if len(suggestions) >= count:
+                    return suggestions
+
+    # 2. SoundCloud fallback suggestions
+    sc_query = f"{clean_artist} {current_title}".strip()
+    for entry in search_soundcloud_music(sc_query, max_results=count + 3):
+        title = (entry.get("title") or "").strip()
+        artist = (entry.get("uploader") or "Unknown").strip()
+        if title and title.lower() not in seen_titles:
+            seen_titles.add(title.lower())
+            suggestions.append({
+                "title": title,
+                "artist": artist,
+                "duration": entry.get("duration", 0),
+            })
+            if len(suggestions) >= count:
+                return suggestions
+
     return suggestions
+
 
 # --- 5. Audio Streaming Tasks ---
 async def stream_music_task():
@@ -624,14 +859,14 @@ async def stream_music_task():
         await asyncio.sleep(0.02)
 
 async def prefetch_autoplay_songs():
-    """Pre-fetch autoplay song suggestions in background"""
+    """Pre-fetch autoplay song suggestions in background without blocking audio streaming."""
     global last_song_metadata, music_queue
 
     try:
         title = last_song_metadata.get('title', '')
         artist = last_song_metadata.get('artist', '')
         if title:
-            suggestions = get_autoplay_suggestions(title, artist, count=3)
+            suggestions = await asyncio.to_thread(get_autoplay_suggestions, title, artist, 3)
             for s in suggestions:
                 await music_queue.put(s)
             print(f"🎵 Pre-fetched {len(suggestions)} autoplay suggestions")
@@ -647,14 +882,16 @@ async def play_next_autoplay_song():
         if last_song_metadata:
             title = last_song_metadata.get('title', '')
             artist = last_song_metadata.get('artist', '')
-            suggestions = get_autoplay_suggestions(title, artist, count=1)
+            suggestions = await asyncio.to_thread(get_autoplay_suggestions, title, artist, 1)
             if suggestions:
                 await music_queue.put(suggestions[0])
 
     if not music_queue.empty():
         next_song = await music_queue.get()
-        current_song_query = f"{next_song['title']} {next_song['artist']}"
-        print(f"🔁 Autoplay: {next_song['title']} by {next_song['artist']}")
+        artist = next_song.get('artist', '')
+        artist_part = "" if not artist or artist == "Unknown" else f" {artist}"
+        current_song_query = f"{next_song['title']}{artist_part}"
+        print(f"🔁 Autoplay: {next_song['title']} by {artist or 'Unknown'}")
         return True
     return False
 
@@ -1062,7 +1299,7 @@ async def main():
     init_memory()
     port = int(os.environ.get("PORT", 8000))
     print(f"[SYSTEM] Starting Jarvis 24/7 Server on 0.0.0.0:{port}...")
-    print(f"[SYSTEM] YouTube Music integration: {'ENABLED' if os.path.exists(COOKIES_FILE) else 'DISABLED (no cookies.txt)'}")
+    print(f"[SYSTEM] Music sources: JioSaavn + SoundCloud + Spotify metadata ({'API' if SPOTIFY_CLIENT_ID else 'oEmbed'}) + YouTube fallback")
     print(f"[SYSTEM] Autoplay: {'ENABLED' if autoplay_enabled else 'DISABLED'}")
     print(f"[SYSTEM] Wake word model: {'LOADED' if oww_model_loaded else 'DISABLED (startup/button wake)'}")
     print(f"[SYSTEM] Startup wake: {'ENABLED' if STARTUP_WAKE_ENABLED else 'DISABLED'} (single_turn={STARTUP_SINGLE_TURN})")
@@ -1105,6 +1342,7 @@ async def main():
                 if music_wf:
                     music_wf.close()
                     music_wf = None
+                drain_queue(music_queue)
                 query, current_song_query = current_song_query, None
                 update_esp32_screen("LOD")
 
