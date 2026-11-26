@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import html
 import http
 import random
@@ -331,20 +332,141 @@ def check_button():
             cmd = "PROACTIVE_NUDGE"
     return cmd
 
-# --- Multi-Source Music Integration (JioSaavn + SoundCloud + Spotify Metadata + YouTube Music) ---
+# --- Multi-Source Music Integration (JioSaavn Direct + Audius + Spotify Metadata + YouTube Fallback) ---
 COOKIES_FILE = "cookies.txt"
 PREFER_YOUTUBE = os.environ.get("PREFER_YOUTUBE", "false").lower() in ("1", "true", "yes")
+ENABLE_SOUNDCLOUD = os.environ.get("ENABLE_SOUNDCLOUD", "false").lower() in ("1", "true", "yes")
+ENABLE_YOUTUBE_FALLBACK = os.environ.get("ENABLE_YOUTUBE_FALLBACK", "true").lower() in ("1", "true", "yes")
 SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "").strip()
 JIOSAAVN_API_BASE = os.environ.get("JIOSAAVN_API_URL", "https://saavn.sumit.co").rstrip("/")
+AUDIUS_API_BASE = os.environ.get("AUDIUS_API_URL", "https://api.audius.co").rstrip("/")
 
 _yt_cookies_invalid = False
 _spotify_token_cache = {"token": None, "expires_at": 0.0}
 _recent_song_titles = []
 
+# Pure-Python DES-ECB tables for decoding official JioSaavn encrypted_media_url
+_DES_IP = [58,50,42,34,26,18,10,2,60,52,44,36,28,20,12,4,62,54,46,38,30,22,14,6,64,56,48,40,32,24,16,8,
+           57,49,41,33,25,17,9,1,59,51,43,35,27,19,11,3,61,53,45,37,29,21,13,5,63,55,47,39,31,23,15,7]
+_DES_FP = [40,8,48,16,56,24,64,32,39,7,47,15,55,23,63,31,38,6,46,14,54,22,62,30,37,5,45,13,53,21,61,29,
+           36,4,44,12,52,20,60,28,35,3,43,11,51,19,59,27,34,2,42,10,50,18,58,26,33,1,41,9,49,17,57,25]
+_DES_E = [32,1,2,3,4,5,4,5,6,7,8,9,8,9,10,11,12,13,12,13,14,15,16,17,
+          16,17,18,19,20,21,20,21,22,23,24,25,24,25,26,27,28,29,28,29,30,31,32,1]
+_DES_P = [16,7,20,21,29,12,28,17,1,15,23,26,5,18,31,10,2,8,24,14,32,27,3,9,19,13,30,6,22,11,4,25]
+_DES_PC1 = [57,49,41,33,25,17,9,1,58,50,42,34,26,18,10,2,59,51,43,35,27,19,11,3,60,52,44,36,
+            63,55,47,39,31,23,15,7,62,54,46,38,30,22,14,6,61,53,45,37,29,21,13,5,28,20,12,4]
+_DES_PC2 = [14,17,11,24,1,5,3,28,15,6,21,10,23,19,12,4,26,8,16,7,27,20,13,2,
+            41,52,31,37,47,55,30,40,51,45,33,48,44,49,39,56,34,53,46,42,50,36,29,32]
+_DES_SHIFTS = [1,1,2,2,2,2,2,2,1,2,2,2,2,2,2,1]
+_DES_SBOX = [
+    [[14,4,13,1,2,15,11,8,3,10,6,12,5,9,0,7],[0,15,7,4,14,2,13,1,10,6,12,11,9,5,3,8],
+     [4,1,14,8,13,6,2,11,15,12,9,7,3,10,5,0],[15,12,8,2,4,9,1,7,5,11,3,14,10,0,6,13]],
+    [[15,1,8,14,6,11,3,4,9,7,2,13,12,0,5,10],[3,13,4,7,15,2,8,14,12,0,1,10,6,9,11,5],
+     [0,14,7,11,10,4,13,1,5,8,12,6,9,3,2,15],[13,8,10,1,3,15,4,2,11,6,7,12,0,5,14,9]],
+    [[10,0,9,14,6,3,15,5,1,13,12,7,11,4,2,8],[13,7,0,9,3,4,6,10,2,8,5,14,12,11,15,1],
+     [13,6,4,9,8,15,3,0,11,1,2,12,5,10,14,7],[1,10,13,0,6,9,8,7,4,15,14,3,11,5,2,12]],
+    [[7,13,14,3,0,6,9,10,1,2,8,5,11,12,4,15],[13,8,11,5,6,15,0,3,4,7,2,12,1,10,14,9],
+     [10,6,9,0,12,11,7,13,15,1,3,14,5,2,8,4],[3,15,0,6,10,1,13,8,9,4,5,11,12,7,2,14]],
+    [[2,12,4,1,7,10,11,6,8,5,3,15,13,0,14,9],[14,11,2,12,4,7,13,1,5,0,15,10,3,9,8,6],
+     [4,2,1,11,10,13,7,8,15,9,12,5,6,3,0,14],[11,8,12,7,1,14,2,13,6,15,0,9,10,4,5,3]],
+    [[12,1,10,15,9,2,6,8,0,13,3,4,14,7,5,11],[10,15,4,2,7,12,9,5,6,1,13,14,0,11,3,8],
+     [9,14,15,5,2,8,12,3,7,0,4,10,1,13,11,6],[4,3,2,12,9,5,15,10,11,14,1,7,6,0,8,13]],
+    [[4,11,2,14,15,0,8,13,3,12,9,7,5,10,6,1],[13,0,11,7,4,9,1,10,14,3,5,12,2,15,8,6],
+     [1,4,11,13,12,3,7,14,10,15,6,8,0,5,9,2],[6,11,13,8,1,4,10,7,9,5,0,15,14,2,3,12]],
+    [[13,2,8,4,6,15,11,1,10,9,3,14,5,0,12,7],[1,15,13,8,10,3,7,4,12,5,6,11,0,14,9,2],
+     [7,11,4,1,9,12,14,2,0,6,10,13,15,3,5,8],[2,1,14,7,4,10,8,13,15,12,9,0,3,5,6,11]],
+]
+
+
+def _des_perm(val, table, n):
+    out = 0
+    for p in table:
+        out = (out << 1) | ((val >> (n - p)) & 1)
+    return out
+
+
+def _des_subkeys(key_bytes):
+    k = _des_perm(int.from_bytes(key_bytes, "big"), _DES_PC1, 64)
+    c, d = (k >> 28) & 0xFFFFFFF, k & 0xFFFFFFF
+    keys = []
+    for s in _DES_SHIFTS:
+        c = ((c << s) | (c >> (28 - s))) & 0xFFFFFFF
+        d = ((d << s) | (d >> (28 - s))) & 0xFFFFFFF
+        keys.append(_des_perm((c << 28) | d, _DES_PC2, 56))
+    return keys
+
+
+def _des_f(r, k):
+    x = _des_perm(r, _DES_E, 32) ^ k
+    out = 0
+    for i in range(8):
+        b = (x >> (42 - 6 * i)) & 0x3F
+        out = (out << 4) | _DES_SBOX[i][((b & 0x20) >> 4) | (b & 1)][(b >> 1) & 0xF]
+    return _des_perm(out, _DES_P, 32)
+
+
+def _decrypt_jiosaavn_url(enc_url):
+    """Decrypt JioSaavn encrypted_media_url using DES-ECB key b'38346591'."""
+    if not enc_url:
+        return None
+    subkeys = _des_subkeys(b"38346591")[::-1]
+    data = base64.b64decode(enc_url.strip())
+    out = bytearray()
+    for i in range(0, len(data), 8):
+        blk = _des_perm(int.from_bytes(data[i:i + 8], "big"), _DES_IP, 64)
+        l, r = blk >> 32, blk & 0xFFFFFFFF
+        for k in subkeys:
+            l, r = r, l ^ _des_f(r, k)
+        out.extend(_des_perm((r << 32) | l, _DES_FP, 64).to_bytes(8, "big"))
+    pad = out[-1]
+    if 1 <= pad <= 8:
+        out = out[:-pad]
+    return bytes(out).decode("utf-8", errors="ignore").strip()
+
+
+_TAMIL_VOWELS = {
+    "அ": "a", "ஆ": "aa", "இ": "i", "ஈ": "ee", "உ": "u", "ஊ": "oo",
+    "எ": "e", "ஏ": "ae", "ஐ": "ai", "ஒ": "o", "ஓ": "oo", "ஔ": "au", "ஃ": "h",
+}
+_TAMIL_CONSONANTS = {
+    "க": "k", "ங": "ng", "ச": "ch", "ஞ": "nj", "ட": "d", "ண": "n",
+    "த": "th", "ந": "n", "ப": "p", "ம": "m", "ய": "y", "ர": "r",
+    "ல": "l", "வ": "v", "ழ": "zh", "ள": "l", "ற": "r", "ன": "n",
+    "ஜ": "j", "ஷ": "sh", "ஸ": "s", "ஹ": "h",
+}
+_TAMIL_SIGNS = {
+    "ா": "aa", "ி": "i", "ீ": "ee", "ு": "u", "ூ": "oo",
+    "ெ": "e", "ே": "ae", "ை": "ai", "ொ": "o", "ோ": "oo", "ௌ": "au", "்": "",
+}
+
+
+def transliterate_tamil_to_latin(text):
+    """Best-effort Tamil Unicode -> Latin phonetic transliteration for music search APIs."""
+    if not text or not any("\u0b80" <= ch <= "\u0bff" for ch in text):
+        return text
+    out = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch in _TAMIL_VOWELS:
+            out.append(_TAMIL_VOWELS[ch])
+        elif ch in _TAMIL_CONSONANTS:
+            base = _TAMIL_CONSONANTS[ch]
+            nxt = text[i + 1] if i + 1 < len(text) else ""
+            if nxt in _TAMIL_SIGNS:
+                out.append(base + _TAMIL_SIGNS[nxt])
+                i += 1
+            else:
+                out.append(base + "a")
+        elif ch not in _TAMIL_SIGNS:
+            out.append(ch)
+        i += 1
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
 
 def _cleanup_temp_audio():
-    for pattern in ["current_song.*", "temp_audio.*", "youtube_audio.*", "sc_audio.*"]:
+    for pattern in ["current_song.*", "temp_audio.*", "youtube_audio.*", "sc_audio.*", "audius_audio.*"]:
         for old in glob.glob(pattern):
             try:
                 os.remove(old)
@@ -352,8 +474,8 @@ def _cleanup_temp_audio():
                 pass
 
 
-def _convert_to_esp32_wav(input_path, output_path="current_song.wav", timeout=30):
-    """Convert any audio file into 16kHz 16-bit mono PCM WAV for ESP32 streaming."""
+def _convert_to_esp32_wav(input_path, output_path="current_song.wav", timeout=20):
+    """Convert any audio file or stream into 16kHz 16-bit mono PCM WAV for ESP32 streaming."""
     cmd = [
         "ffmpeg", "-y", "-i", input_path,
         "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
@@ -361,7 +483,7 @@ def _convert_to_esp32_wav(input_path, output_path="current_song.wav", timeout=30
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
-        print(f"❌ FFmpeg error: {result.stderr}")
+        print(f"❌ FFmpeg error: {result.stderr[-300:]}")
         return False
     return os.path.exists(output_path) and os.path.getsize(output_path) > 10000
 
@@ -389,7 +511,7 @@ def _get_spotify_access_token():
             "https://accounts.spotify.com/api/token",
             data={"grant_type": "client_credentials"},
             auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
-            timeout=6,
+            timeout=5,
         )
         if resp.status_code == 200:
             payload = resp.json()
@@ -402,15 +524,14 @@ def _get_spotify_access_token():
 
 
 def resolve_spotify_query(query):
-    """Resolve Spotify URLs or optional Spotify API searches into 'Track Artist' text."""
+    """Resolve Spotify URLs or optional Spotify API searches, and normalize Tamil text for search."""
     q = (query or "").strip()
     if not q:
         return q
 
-    # 1. Handle Spotify links via public oEmbed (no API key needed)
     if "open.spotify.com/" in q:
         try:
-            r = requests.get("https://open.spotify.com/oembed", params={"url": q}, timeout=6)
+            r = requests.get("https://open.spotify.com/oembed", params={"url": q}, timeout=5)
             if r.status_code == 200:
                 title = html.unescape(r.json().get("title", "")).strip()
                 if title:
@@ -419,7 +540,6 @@ def resolve_spotify_query(query):
         except Exception as e:
             print(f"⚠️ Spotify oEmbed resolve failed: {e}")
 
-    # 2. Optional Spotify Web API enrichment when credentials are set
     token = _get_spotify_access_token()
     if token:
         try:
@@ -427,7 +547,7 @@ def resolve_spotify_query(query):
                 "https://api.spotify.com/v1/search",
                 params={"q": q, "type": "track", "limit": 1},
                 headers={"Authorization": f"Bearer {token}"},
-                timeout=6,
+                timeout=5,
             )
             if r.status_code == 200:
                 items = r.json().get("tracks", {}).get("items", [])
@@ -442,6 +562,12 @@ def resolve_spotify_query(query):
         except Exception as e:
             print(f"⚠️ Spotify search skipped: {e}")
 
+    if any("\u0b80" <= ch <= "\u0bff" for ch in q):
+        romanized = transliterate_tamil_to_latin(q)
+        if romanized and romanized != q:
+            print(f"🔤 Transliterated Tamil query: '{q}' -> '{romanized}'")
+            return romanized
+
     return q
 
 
@@ -453,33 +579,106 @@ def _extract_jiosaavn_artist(song):
             names = [html.unescape(a.get("name", "")) for a in primary[:2] if a.get("name")]
             if names:
                 return ", ".join(names)
-    primary_artists = song.get("primaryArtists")
-    if isinstance(primary_artists, str) and primary_artists.strip():
-        return html.unescape(primary_artists.strip())
+    more_info = song.get("more_info") or {}
+    artist_map = (more_info.get("artistMap") or {}).get("primary_artists") or []
+    if isinstance(artist_map, list) and artist_map:
+        names = [html.unescape(a.get("name", "")) for a in artist_map[:2] if a.get("name")]
+        if names:
+            return ", ".join(names)
+    for key in ("primaryArtists", "music", "subtitle"):
+        val = song.get(key) or more_info.get(key)
+        if isinstance(val, str) and val.strip():
+            return html.unescape(val.strip())
     return "Unknown"
 
 
+def _build_jiosaavn_candidate_urls(base_url):
+    """Order JioSaavn AAC URLs for fastest ESP32 16kHz conversion (_160 -> _96 -> _320)."""
+    if not base_url:
+        return []
+    urls = []
+    for q_tag in ("_160.mp4", "_96.mp4", "_320.mp4"):
+        replaced = re.sub(r"_(?:96|160|320)\.mp4$", q_tag, base_url)
+        if replaced not in urls:
+            urls.append(replaced)
+    if base_url not in urls:
+        urls.append(base_url)
+    return urls
+
+
 def search_jiosaavn_songs(query, limit=5):
-    """Search JioSaavn via active API endpoints (no cookies or bot gates required)."""
-    endpoints = [
-        f"{JIOSAAVN_API_BASE}/api/search/songs",
-    ]
-    for url in endpoints:
-        try:
-            resp = requests.get(url, params={"query": query, "limit": limit}, timeout=8)
-            if resp.status_code != 200:
-                continue
+    """Search JioSaavn directly via official API first, then saavn.sumit.co mirror."""
+    normalized = []
+
+    # 1. Direct official JioSaavn API (~0.6s, no third-party proxy rate limits)
+    try:
+        resp = requests.get(
+            "https://www.jiosaavn.com/api.php",
+            params={
+                "__call": "search.getResults",
+                "_format": "json",
+                "_marker": "0",
+                "api_version": "4",
+                "ctx": "web6dot0",
+                "q": query,
+                "n": str(limit),
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=(4, 6),
+        )
+        if resp.status_code == 200:
+            for s in resp.json().get("results") or []:
+                more = s.get("more_info") or {}
+                enc = more.get("encrypted_media_url") or s.get("encrypted_media_url")
+                dec_url = _decrypt_jiosaavn_url(enc) if enc else None
+                if not dec_url:
+                    continue
+                normalized.append({
+                    "id": s.get("id", ""),
+                    "name": html.unescape(s.get("title") or s.get("song") or query),
+                    "artist": _extract_jiosaavn_artist(s),
+                    "duration": int(more.get("duration") or s.get("duration") or 0),
+                    "urls": _build_jiosaavn_candidate_urls(dec_url),
+                })
+            if normalized:
+                return normalized
+    except Exception as e:
+        print(f"⚠️ Direct JioSaavn search error: {e}")
+
+    # 2. Mirror API fallback (saavn.sumit.co)
+    try:
+        resp = requests.get(
+            f"{JIOSAAVN_API_BASE}/api/search/songs",
+            params={"query": query, "limit": limit},
+            timeout=(4, 6),
+        )
+        if resp.status_code == 200:
             data = resp.json()
             results = (data.get("data") or {}).get("results") or data.get("results") or []
-            if isinstance(results, list) and results:
-                return results
-        except Exception as e:
-            print(f"⚠️ JioSaavn search error ({url}): {e}")
-    return []
+            for s in results:
+                dl_links = s.get("downloadUrl") or []
+                urls = [d.get("url") or d.get("link") for d in reversed(dl_links) if d.get("url") or d.get("link")]
+                # Prefer 160kbps/96kbps before 320kbps for faster download
+                ordered_urls = sorted(
+                    urls,
+                    key=lambda u: 0 if "_160." in u else 1 if "_96." in u else 2,
+                )
+                if ordered_urls:
+                    normalized.append({
+                        "id": s.get("id", ""),
+                        "name": html.unescape(s.get("name") or s.get("title") or query),
+                        "artist": _extract_jiosaavn_artist(s),
+                        "duration": int(s.get("duration") or 0),
+                        "urls": ordered_urls,
+                    })
+    except Exception as e:
+        print(f"⚠️ Mirror JioSaavn search error: {e}")
+
+    return normalized
 
 
 def download_jiosaavn_fallback(query):
-    """Search and download audio from JioSaavn (320kbps AAC -> 16kHz mono WAV)."""
+    """Search and download full songs from JioSaavn (~1-3s total)."""
     print(f"🎵 Searching JioSaavn: {query}")
     results = search_jiosaavn_songs(query, limit=5)
     if not results:
@@ -487,29 +686,95 @@ def download_jiosaavn_fallback(query):
         return None, None, None
 
     for song in results:
-        dl_links = song.get("downloadUrl") or []
-        if not isinstance(dl_links, list) or not dl_links:
-            continue
-        stream_url = dl_links[-1].get("url") or dl_links[-1].get("link")
-        if not stream_url:
-            continue
+        title = song["name"]
+        artist = song["artist"]
+        song_id = song["id"]
+        duration = song["duration"]
 
-        title = html.unescape(song.get("name") or song.get("title") or query)
-        artist = _extract_jiosaavn_artist(song)
-        song_id = song.get("id", "")
-        duration = song.get("duration") or 0
+        for stream_url in song["urls"]:
+            try:
+                print(f"⬇️ Downloading full song (JioSaavn): {title} - {artist}")
+                audio_resp = requests.get(stream_url, timeout=(4, 12))
+                if audio_resp.status_code != 200 or len(audio_resp.content) < 10000:
+                    continue
+                with open("temp_audio.m4a", "wb") as f:
+                    f.write(audio_resp.content)
+
+                ok = _convert_to_esp32_wav("temp_audio.m4a", "current_song.wav", timeout=15)
+                try:
+                    os.remove("temp_audio.m4a")
+                except Exception:
+                    pass
+
+                if ok:
+                    metadata = {
+                        "title": title,
+                        "artist": artist,
+                        "song_id": song_id,
+                        "duration": duration,
+                        "source": "jiosaavn",
+                    }
+                    _record_recent_song(title)
+                    print(f"✅ Ready (JioSaavn): {title} ({os.path.getsize('current_song.wav')} bytes)")
+                    return "current_song.wav", title, metadata
+            except Exception as e:
+                print(f"⚠️ JioSaavn stream failed ({title}): {e}")
+                try:
+                    if os.path.exists("temp_audio.m4a"):
+                        os.remove("temp_audio.m4a")
+                except Exception:
+                    pass
+
+    return None, None, None
+
+
+def search_audius_songs(query, limit=5):
+    """Search full-length public tracks on Audius (no API key or cookies needed)."""
+    try:
+        resp = requests.get(
+            f"{AUDIUS_API_BASE}/v1/tracks/search",
+            params={"query": query, "app_name": "jarvis-esp32"},
+            timeout=(4, 6),
+        )
+        if resp.status_code != 200:
+            return []
+        tracks = resp.json().get("data") or []
+        # Filter out short clips (<45s) so only full songs are returned
+        full_tracks = [t for t in tracks if (t.get("duration") or 0) >= 45]
+        return (full_tracks or tracks)[:limit]
+    except Exception as e:
+        print(f"⚠️ Audius search error: {e}")
+        return []
+
+
+def download_audius_song(query):
+    """Download full-length song from Audius decentralized streaming API."""
+    print(f"🎧 Searching Audius (full tracks): {query}")
+    tracks = search_audius_songs(query, limit=4)
+    if not tracks:
+        print("❌ No full tracks found on Audius")
+        return None, None, None
+
+    for track in tracks:
+        track_id = track.get("id")
+        if not track_id:
+            continue
+        title = html.unescape(track.get("title") or query)
+        artist = html.unescape((track.get("user") or {}).get("name") or "Unknown")
+        duration = int(track.get("duration") or 0)
+        stream_url = f"{AUDIUS_API_BASE}/v1/tracks/{track_id}/stream?app_name=jarvis-esp32"
 
         try:
-            print(f"⬇️ Downloading from JioSaavn: {title} - {artist}")
-            audio_resp = requests.get(stream_url, timeout=20)
-            audio_resp.raise_for_status()
-            with open("temp_audio.m4a", "wb") as f:
+            print(f"⬇️ Downloading full song (Audius): {title} - {artist}")
+            audio_resp = requests.get(stream_url, timeout=(4, 15), allow_redirects=True)
+            if audio_resp.status_code != 200 or len(audio_resp.content) < 10000:
+                continue
+            with open("audius_audio.mp3", "wb") as f:
                 f.write(audio_resp.content)
 
-            print("🔄 Converting to ESP32 WAV format (16kHz Mono)...")
-            ok = _convert_to_esp32_wav("temp_audio.m4a", "current_song.wav", timeout=25)
+            ok = _convert_to_esp32_wav("audius_audio.mp3", "current_song.wav", timeout=20)
             try:
-                os.remove("temp_audio.m4a")
+                os.remove("audius_audio.mp3")
             except Exception:
                 pass
 
@@ -517,18 +782,18 @@ def download_jiosaavn_fallback(query):
                 metadata = {
                     "title": title,
                     "artist": artist,
-                    "song_id": song_id,
+                    "track_id": track_id,
                     "duration": duration,
-                    "source": "jiosaavn",
+                    "source": "audius",
                 }
                 _record_recent_song(title)
-                print(f"✅ Ready (JioSaavn): {title} ({os.path.getsize('current_song.wav')} bytes)")
+                print(f"✅ Ready (Audius): {title} ({os.path.getsize('current_song.wav')} bytes)")
                 return "current_song.wav", title, metadata
         except Exception as e:
-            print(f"⚠️ JioSaavn track download failed ({title}): {e}")
+            print(f"⚠️ Audius track failed ({title}): {e}")
             try:
-                if os.path.exists("temp_audio.m4a"):
-                    os.remove("temp_audio.m4a")
+                if os.path.exists("audius_audio.mp3"):
+                    os.remove("audius_audio.mp3")
             except Exception:
                 pass
 
@@ -536,36 +801,33 @@ def download_jiosaavn_fallback(query):
 
 
 def search_soundcloud_music(query, max_results=5):
-    """Search SoundCloud via yt-dlp without cookies."""
+    """Search full-length tracks on SoundCloud via yt-dlp."""
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "extract_flat": "in_playlist",
         "noplaylist": True,
-        "socket_timeout": 15,
+        "socket_timeout": 8,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             result = ydl.extract_info(f"scsearch{max_results}:{query}", download=False)
             if result and "entries" in result:
-                return [e for e in result["entries"] if e]
+                return [e for e in result["entries"] if e and (e.get("duration") or 0) >= 60]
     except Exception as e:
         print(f"⚠️ SoundCloud search error: {e}")
     return []
 
 
 def download_soundcloud_song(query):
-    """Search and download public audio from SoundCloud via yt-dlp (no cookies needed)."""
-    print(f"🟠 Searching SoundCloud: {query}")
+    """Optional SoundCloud full-track fallback (disabled by default due to 30s Go+ clips)."""
+    print(f"🟠 Searching SoundCloud (full tracks only): {query}")
     entries = search_soundcloud_music(query, max_results=4)
     if not entries:
-        print("❌ No results found on SoundCloud")
+        print("❌ No full tracks found on SoundCloud")
         return None, None, None
 
-    # Prefer full tracks (>45s) over 30s Go+ previews when possible
-    ordered = sorted(entries, key=lambda e: 0 if (e.get("duration") or 0) > 45 else 1)
-
-    for entry in ordered:
+    for entry in entries:
         track_url = entry.get("url") or entry.get("webpage_url")
         if not track_url:
             continue
@@ -579,8 +841,8 @@ def download_soundcloud_song(query):
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
-            "socket_timeout": 20,
-            "retries": 2,
+            "socket_timeout": 10,
+            "retries": 1,
         }
         try:
             print(f"⬇️ Downloading from SoundCloud: {title} by {artist}")
@@ -592,8 +854,7 @@ def download_soundcloud_song(query):
                 continue
             downloaded_file = downloaded_files[0]
 
-            print("🔄 Converting to ESP32 WAV format (16kHz Mono)...")
-            ok = _convert_to_esp32_wav(downloaded_file, "current_song.wav", timeout=30)
+            ok = _convert_to_esp32_wav(downloaded_file, "current_song.wav", timeout=20)
             try:
                 os.remove(downloaded_file)
             except Exception:
@@ -621,7 +882,7 @@ def download_soundcloud_song(query):
 
 
 def get_ydl_opts(output_template="temp_audio.%(ext)s", use_cookies=True):
-    """Configure yt-dlp options for YouTube Music."""
+    """Configure fast-fail yt-dlp options for YouTube Music."""
     opts = {
         "format": "bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": output_template,
@@ -633,9 +894,9 @@ def get_ydl_opts(output_template="temp_audio.%(ext)s", use_cookies=True):
             "preferredcodec": "m4a",
             "preferredquality": "0",
         }],
-        "socket_timeout": 20,
-        "retries": 2,
-        "fragment_retries": 2,
+        "socket_timeout": 6,
+        "retries": 0,
+        "fragment_retries": 0,
         "ignoreerrors": False,
     }
 
@@ -684,12 +945,14 @@ def get_youtube_music_url(video_id):
 
 
 def _download_youtube_music_direct(query):
-    """Attempt download from YouTube Music via yt-dlp."""
+    """Fast-fail YouTube Music fallback via yt-dlp."""
     global _yt_cookies_invalid
-    print(f"📺 Searching YouTube Music: {query}")
+    if not ENABLE_YOUTUBE_FALLBACK:
+        return None, None, None
+    print(f"📺 Trying YouTube Music fallback: {query}")
 
     try:
-        search_results = search_youtube_music(query, max_results=3)
+        search_results = search_youtube_music(query, max_results=2)
         if not search_results:
             return None, None, None
 
@@ -699,7 +962,6 @@ def _download_youtube_music_direct(query):
         uploader = best_result.get("uploader", "Unknown")
         duration = best_result.get("duration", 0)
 
-        print(f"🎯 Found on YouTube: {title} by {uploader} (ID: {video_id})")
         ydl_opts = get_ydl_opts("youtube_audio.%(ext)s", use_cookies=True)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([f"https://music.youtube.com/watch?v={video_id}"])
@@ -709,7 +971,7 @@ def _download_youtube_music_direct(query):
             return None, None, None
 
         downloaded_file = downloaded_files[0]
-        ok = _convert_to_esp32_wav(downloaded_file, "current_song.wav", timeout=30)
+        ok = _convert_to_esp32_wav(downloaded_file, "current_song.wav", timeout=20)
         try:
             os.remove(downloaded_file)
         except Exception:
@@ -736,8 +998,8 @@ def _download_youtube_music_direct(query):
 
 def download_youtube_music_song(query):
     """
-    Download a song using resilient multi-source fallback:
-    Spotify metadata (optional) -> JioSaavn -> SoundCloud -> YouTube Music.
+    Download a full song quickly using reliable cookie-free sources:
+    Spotify metadata / Tamil transliteration -> JioSaavn Direct -> Audius -> YouTube fallback.
     Returns (wav_file_path, song_title, metadata_dict).
     """
     print(f"\n[MUSIC] 🎵 Resolving song request: {query}")
@@ -745,18 +1007,14 @@ def download_youtube_music_song(query):
 
     resolved_query = resolve_spotify_query(query)
 
-    if PREFER_YOUTUBE:
-        providers = [
-            _download_youtube_music_direct,
-            download_jiosaavn_fallback,
-            download_soundcloud_song,
-        ]
-    else:
-        providers = [
-            download_jiosaavn_fallback,
-            download_soundcloud_song,
-            _download_youtube_music_direct,
-        ]
+    providers = [download_jiosaavn_fallback, download_audius_song]
+    if ENABLE_SOUNDCLOUD:
+        providers.append(download_soundcloud_song)
+    if ENABLE_YOUTUBE_FALLBACK:
+        if PREFER_YOUTUBE:
+            providers.insert(0, _download_youtube_music_direct)
+        else:
+            providers.append(_download_youtube_music_direct)
 
     for provider in providers:
         wav_path, title, meta = provider(resolved_query)
@@ -768,17 +1026,17 @@ def download_youtube_music_song(query):
 
 
 def get_autoplay_suggestions(current_title, current_artist, count=5):
-    """Get autoplay suggestions across JioSaavn, SoundCloud, and YouTube without repeating recent songs."""
+    """Get full-song autoplay suggestions from JioSaavn and Audius without repeating recent songs."""
     suggestions = []
     seen_titles = set(_recent_song_titles)
     clean_artist = "" if not current_artist or current_artist == "Unknown" else current_artist.split(",")[0].strip()
 
-    # 1. JioSaavn artist / mood search
+    # 1. JioSaavn artist / similar search
     saavn_queries = [q for q in [clean_artist, f"{current_title} mix", "tamil hits"] if q]
     for sq in saavn_queries:
         for song in search_jiosaavn_songs(sq, limit=count + 3):
-            title = html.unescape(song.get("name") or song.get("title") or "").strip()
-            artist = _extract_jiosaavn_artist(song)
+            title = song["name"].strip()
+            artist = song["artist"]
             if title and title.lower() not in seen_titles:
                 seen_titles.add(title.lower())
                 suggestions.append({
@@ -790,17 +1048,17 @@ def get_autoplay_suggestions(current_title, current_artist, count=5):
                 if len(suggestions) >= count:
                     return suggestions
 
-    # 2. SoundCloud fallback suggestions
-    sc_query = f"{clean_artist} {current_title}".strip()
-    for entry in search_soundcloud_music(sc_query, max_results=count + 3):
-        title = (entry.get("title") or "").strip()
-        artist = (entry.get("uploader") or "Unknown").strip()
+    # 2. Audius full-track fallback suggestions
+    aud_query = clean_artist or current_title
+    for track in search_audius_songs(aud_query, limit=count + 2):
+        title = html.unescape(track.get("title") or "").strip()
+        artist = html.unescape((track.get("user") or {}).get("name") or "Unknown").strip()
         if title and title.lower() not in seen_titles:
             seen_titles.add(title.lower())
             suggestions.append({
                 "title": title,
                 "artist": artist,
-                "duration": entry.get("duration", 0),
+                "duration": track.get("duration", 0),
             })
             if len(suggestions) >= count:
                 return suggestions
@@ -938,7 +1196,7 @@ def build_system_instruction():
 1. மோழி: இயல்பான தமிழில் (Tamil) பேசு. English 섞ும் இடங்களில் seamlessly switch பண்ணு.
 2. PERSONALITY: Witty, inspirational, slightly crazy (good crazy), deep thinker, humorous, motivating.
 3. INTELLECTUAL DEPTH: Surface level जवाबقاتு டா - ஆழம், connection, insight காட்டு.
-4. MUSIC: பயனர் பாடல் கேட்டால் `play_music` tool பயன்படுத்து. YouTube Music + Autoplay = ∞ music.
+4. MUSIC: பயனர் பாடல் கேட்டால் `play_music` tool பயன்படுத்து. `song_name` parameter-ஐ எப்போதும் English/Romanized எழுத்துக்களில் மட்டும் கொடு (எ.கா: "Arabic Kuthu Anirudh", "Munbe Vaa", "Shape of You") — Tamil script-ல் கொடுக்காதே.
 5. MEMORY: கணேஷ் ஏதேனும் கூறினால் `save_user_memory` உடனே save பண்ணு.
 6. PROACTIVE: நேரம் வீணடிக்காது, எப்போதும் கண்ணியாக stay hungry, stay foolish.
 
@@ -953,10 +1211,10 @@ async def live_audio_session(initial_greeting=False, nudge_reason=None, single_t
     jarvis_tools = types.Tool(function_declarations=[
         types.FunctionDeclaration(
             name="play_music",
-            description="Play a song or music track from YouTube Music",
+            description="Play a full song. Always pass song_name in English/Romanized script (e.g. 'Arabic Kuthu Anirudh', 'Munbe Vaa', 'Shape of You'), never Tamil script.",
             parameters=types.Schema(
                 type=types.Type.OBJECT,
-                properties={"song_name": types.Schema(type=types.Type.STRING)},
+                properties={"song_name": types.Schema(type=types.Type.STRING, description="Song title and artist in English/Romanized letters")},
                 required=["song_name"]
             )
         ),
@@ -1299,7 +1557,7 @@ async def main():
     init_memory()
     port = int(os.environ.get("PORT", 8000))
     print(f"[SYSTEM] Starting Jarvis 24/7 Server on 0.0.0.0:{port}...")
-    print(f"[SYSTEM] Music sources: JioSaavn + SoundCloud + Spotify metadata ({'API' if SPOTIFY_CLIENT_ID else 'oEmbed'}) + YouTube fallback")
+    print(f"[SYSTEM] Music sources: JioSaavn Direct + Audius + Spotify metadata ({'API' if SPOTIFY_CLIENT_ID else 'oEmbed'}) + YouTube fallback")
     print(f"[SYSTEM] Autoplay: {'ENABLED' if autoplay_enabled else 'DISABLED'}")
     print(f"[SYSTEM] Wake word model: {'LOADED' if oww_model_loaded else 'DISABLED (startup/button wake)'}")
     print(f"[SYSTEM] Startup wake: {'ENABLED' if STARTUP_WAKE_ENABLED else 'DISABLED'} (single_turn={STARTUP_SINGLE_TURN})")
