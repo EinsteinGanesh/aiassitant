@@ -336,7 +336,7 @@ def check_button():
 COOKIES_FILE = "cookies.txt"
 PREFER_YOUTUBE = os.environ.get("PREFER_YOUTUBE", "false").lower() in ("1", "true", "yes")
 ENABLE_SOUNDCLOUD = os.environ.get("ENABLE_SOUNDCLOUD", "false").lower() in ("1", "true", "yes")
-ENABLE_YOUTUBE_FALLBACK = os.environ.get("ENABLE_YOUTUBE_FALLBACK", "true").lower() in ("1", "true", "yes")
+ENABLE_YOUTUBE_FALLBACK = os.environ.get("ENABLE_YOUTUBE_FALLBACK", "false").lower() in ("1", "true", "yes")
 SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "").strip()
 JIOSAAVN_API_BASE = os.environ.get("JIOSAAVN_API_URL", "https://saavn.sumit.co").rstrip("/")
@@ -345,6 +345,7 @@ AUDIUS_API_BASE = os.environ.get("AUDIUS_API_URL", "https://api.audius.co").rstr
 _yt_cookies_invalid = False
 _spotify_token_cache = {"token": None, "expires_at": 0.0}
 _recent_song_titles = []
+_next_is_autoplay = False
 
 # Pure-Python DES-ECB tables for decoding official JioSaavn encrypted_media_url
 _DES_IP = [58,50,42,34,26,18,10,2,60,52,44,36,28,20,12,4,62,54,46,38,30,22,14,6,64,56,48,40,32,24,16,8,
@@ -563,6 +564,17 @@ def resolve_spotify_query(query):
             print(f"⚠️ Spotify search skipped: {e}")
 
     if any("\u0b80" <= ch <= "\u0bff" for ch in q):
+        try:
+            resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=f"Convert this Tamil song request into its exact popular Romanized/English song title and artist for music search. Return ONLY the song title (and artist if clear), no quotes or explanation:\n{q}",
+            )
+            converted = (resp.text or "").strip().splitlines()[0].strip(" \"'")
+            if converted and not any("\u0b80" <= ch <= "\u0bff" for ch in converted):
+                print(f"🔤 Normalized Tamil song query: '{q}' -> '{converted}'")
+                return converted
+        except Exception as e:
+            print(f"⚠️ Gemini Tamil song normalization skipped: {e}")
         romanized = transliterate_tamil_to_latin(q)
         if romanized and romanized != q:
             print(f"🔤 Transliterated Tamil query: '{q}' -> '{romanized}'")
@@ -592,95 +604,119 @@ def _extract_jiosaavn_artist(song):
     return "Unknown"
 
 
+def _extract_jiosaavn_artist_id(song):
+    artists = song.get("artists", {})
+    if isinstance(artists, dict):
+        primary = artists.get("primary") or []
+        if isinstance(primary, list) and primary:
+            return primary[0].get("id", "") or ""
+    artist_map = ((song.get("more_info") or {}).get("artistMap") or {}).get("primary_artists") or []
+    if isinstance(artist_map, list) and artist_map:
+        return artist_map[0].get("id", "") or ""
+    return ""
+
+
+def _parse_sumit_song(s, fallback_query=""):
+    dl_links = s.get("downloadUrl") or []
+    urls = [d.get("url") or d.get("link") for d in reversed(dl_links) if d.get("url") or d.get("link")]
+    if not urls:
+        return None
+    album = s.get("album") or {}
+    return {
+        "id": s.get("id", ""),
+        "name": html.unescape(s.get("name") or s.get("title") or fallback_query),
+        "artist": _extract_jiosaavn_artist(s),
+        "artist_id": _extract_jiosaavn_artist_id(s),
+        "album": html.unescape(album.get("name", "")) if isinstance(album, dict) else "",
+        "album_id": album.get("id", "") if isinstance(album, dict) else "",
+        "language": (s.get("language") or "").lower(),
+        "duration": int(s.get("duration") or 0),
+        "urls": urls,
+    }
+
+
 def _build_jiosaavn_candidate_urls(base_url):
-    """Order JioSaavn AAC URLs for fastest ESP32 16kHz conversion (_160 -> _96 -> _320)."""
+    """Return JioSaavn AAC URLs prioritizing standard bitrate."""
     if not base_url:
         return []
-    urls = []
-    for q_tag in ("_160.mp4", "_96.mp4", "_320.mp4"):
+    urls = [base_url]
+    for q_tag in ("_160.mp4", "_96.mp4"):
         replaced = re.sub(r"_(?:96|160|320)\.mp4$", q_tag, base_url)
         if replaced not in urls:
             urls.append(replaced)
-    if base_url not in urls:
-        urls.append(base_url)
     return urls
 
 
-def search_jiosaavn_songs(query, limit=5):
-    """Search JioSaavn directly via official API first, then saavn.sumit.co mirror."""
+def search_jiosaavn_songs(query, limit=8, tamil_only=False):
+    """Search JioSaavn (saavn.sumit.co primary like working build, direct jiosaavn.com backup)."""
     normalized = []
 
-    # 1. Direct official JioSaavn API (~0.6s, no third-party proxy rate limits)
-    try:
-        resp = requests.get(
-            "https://www.jiosaavn.com/api.php",
-            params={
-                "__call": "search.getResults",
-                "_format": "json",
-                "_marker": "0",
-                "api_version": "4",
-                "ctx": "web6dot0",
-                "q": query,
-                "n": str(limit),
-            },
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=(4, 6),
-        )
-        if resp.status_code == 200:
-            for s in resp.json().get("results") or []:
-                more = s.get("more_info") or {}
-                enc = more.get("encrypted_media_url") or s.get("encrypted_media_url")
-                dec_url = _decrypt_jiosaavn_url(enc) if enc else None
-                if not dec_url:
-                    continue
-                normalized.append({
-                    "id": s.get("id", ""),
-                    "name": html.unescape(s.get("title") or s.get("song") or query),
-                    "artist": _extract_jiosaavn_artist(s),
-                    "duration": int(more.get("duration") or s.get("duration") or 0),
-                    "urls": _build_jiosaavn_candidate_urls(dec_url),
-                })
-            if normalized:
-                return normalized
-    except Exception as e:
-        print(f"⚠️ Direct JioSaavn search error: {e}")
-
-    # 2. Mirror API fallback (saavn.sumit.co)
+    # 1. saavn.sumit.co API (reliable on Render / cloud hosts, exact dl_links[-1] URLs)
     try:
         resp = requests.get(
             f"{JIOSAAVN_API_BASE}/api/search/songs",
             params={"query": query, "limit": limit},
-            timeout=(4, 6),
+            timeout=8,
         )
         if resp.status_code == 200:
             data = resp.json()
             results = (data.get("data") or {}).get("results") or data.get("results") or []
             for s in results:
-                dl_links = s.get("downloadUrl") or []
-                urls = [d.get("url") or d.get("link") for d in reversed(dl_links) if d.get("url") or d.get("link")]
-                # Prefer 160kbps/96kbps before 320kbps for faster download
-                ordered_urls = sorted(
-                    urls,
-                    key=lambda u: 0 if "_160." in u else 1 if "_96." in u else 2,
-                )
-                if ordered_urls:
+                parsed = _parse_sumit_song(s, query)
+                if parsed:
+                    normalized.append(parsed)
+    except Exception as e:
+        print(f"⚠️ JioSaavn mirror search error: {e}")
+
+    # 2. Direct official JioSaavn API backup
+    if not normalized:
+        try:
+            resp = requests.get(
+                "https://www.jiosaavn.com/api.php",
+                params={
+                    "__call": "search.getResults",
+                    "_format": "json",
+                    "_marker": "0",
+                    "api_version": "4",
+                    "ctx": "web6dot0",
+                    "q": query,
+                    "n": str(limit),
+                },
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                for s in resp.json().get("results") or []:
+                    more = s.get("more_info") or {}
+                    enc = more.get("encrypted_media_url") or s.get("encrypted_media_url")
+                    dec_url = _decrypt_jiosaavn_url(enc) if enc else None
+                    if not dec_url:
+                        continue
                     normalized.append({
                         "id": s.get("id", ""),
-                        "name": html.unescape(s.get("name") or s.get("title") or query),
+                        "name": html.unescape(s.get("title") or s.get("song") or query),
                         "artist": _extract_jiosaavn_artist(s),
-                        "duration": int(s.get("duration") or 0),
-                        "urls": ordered_urls,
+                        "artist_id": _extract_jiosaavn_artist_id(s),
+                        "album": html.unescape(more.get("album", "") or ""),
+                        "album_id": more.get("album_id", "") or "",
+                        "language": (s.get("language") or more.get("language") or "").lower(),
+                        "duration": int(more.get("duration") or s.get("duration") or 0),
+                        "urls": [dec_url] + _build_jiosaavn_candidate_urls(dec_url),
                     })
-    except Exception as e:
-        print(f"⚠️ Mirror JioSaavn search error: {e}")
+        except Exception as e:
+            print(f"⚠️ Direct JioSaavn search error: {e}")
 
-    return normalized
+    if tamil_only:
+        return [s for s in normalized if s.get("language") == "tamil"]
+
+    # Prefer Tamil matches first when available (avoids Hindi/Punjabi covers winning ties)
+    return sorted(normalized, key=lambda s: 0 if s.get("language") == "tamil" else 1)
 
 
-def download_jiosaavn_fallback(query):
-    """Search and download full songs from JioSaavn (~1-3s total)."""
+def download_jiosaavn_fallback(query, tamil_only=False):
+    """Search and download full songs from JioSaavn."""
     print(f"🎵 Searching JioSaavn: {query}")
-    results = search_jiosaavn_songs(query, limit=5)
+    results = search_jiosaavn_songs(query, limit=8, tamil_only=tamil_only)
     if not results:
         print("❌ Song not found on JioSaavn")
         return None, None, None
@@ -693,14 +729,14 @@ def download_jiosaavn_fallback(query):
 
         for stream_url in song["urls"]:
             try:
-                print(f"⬇️ Downloading full song (JioSaavn): {title} - {artist}")
-                audio_resp = requests.get(stream_url, timeout=(4, 12))
+                print(f"⬇️ Downloading from JioSaavn ({song.get('language') or 'unknown'}): {title} - {artist}")
+                audio_resp = requests.get(stream_url, timeout=15)
                 if audio_resp.status_code != 200 or len(audio_resp.content) < 10000:
                     continue
                 with open("temp_audio.m4a", "wb") as f:
                     f.write(audio_resp.content)
 
-                ok = _convert_to_esp32_wav("temp_audio.m4a", "current_song.wav", timeout=15)
+                ok = _convert_to_esp32_wav("temp_audio.m4a", "current_song.wav", timeout=20)
                 try:
                     os.remove("temp_audio.m4a")
                 except Exception:
@@ -710,6 +746,10 @@ def download_jiosaavn_fallback(query):
                     metadata = {
                         "title": title,
                         "artist": artist,
+                        "artist_id": song.get("artist_id", ""),
+                        "album": song.get("album", ""),
+                        "album_id": song.get("album_id", ""),
+                        "language": song.get("language", ""),
                         "song_id": song_id,
                         "duration": duration,
                         "source": "jiosaavn",
@@ -996,16 +1036,24 @@ def _download_youtube_music_direct(query):
     return None, None, None
 
 
-def download_youtube_music_song(query):
+def download_youtube_music_song(query, tamil_only=False):
     """
     Download a full song quickly using reliable cookie-free sources:
-    Spotify metadata / Tamil transliteration -> JioSaavn Direct -> Audius -> YouTube fallback.
+    Spotify metadata / Tamil normalization -> JioSaavn -> Audius -> optional YouTube fallback.
+    When tamil_only=True (autoplay), strictly plays Tamil songs from JioSaavn.
     Returns (wav_file_path, song_title, metadata_dict).
     """
-    print(f"\n[MUSIC] 🎵 Resolving song request: {query}")
+    print(f"\n[MUSIC] 🎵 Resolving song request: {query} (tamil_only={tamil_only})")
     _cleanup_temp_audio()
 
     resolved_query = resolve_spotify_query(query)
+
+    if tamil_only:
+        wav_path, title, meta = download_jiosaavn_fallback(resolved_query, tamil_only=True)
+        if wav_path and os.path.exists(wav_path):
+            return wav_path, title, meta
+        print("❌ No Tamil autoplay match found for query:", resolved_query)
+        return None, None, None
 
     providers = [download_jiosaavn_fallback, download_audius_song]
     if ENABLE_SOUNDCLOUD:
@@ -1025,42 +1073,72 @@ def download_youtube_music_song(query):
     return None, None, None
 
 
-def get_autoplay_suggestions(current_title, current_artist, count=5):
-    """Get full-song autoplay suggestions from JioSaavn and Audius without repeating recent songs."""
+def get_autoplay_suggestions(current_title, current_artist, count=5, metadata=None):
+    """
+    Get related Tamil-only autoplay suggestions for the currently playing song.
+    Order: same Tamil movie/album -> same artist's Tamil songs -> Tamil hit search.
+    Strictly excludes Hindi, Telugu, Malayalam, Kannada, and non-Tamil tracks.
+    """
+    meta = metadata or {}
+    album_id = meta.get("album_id", "")
+    artist_id = meta.get("artist_id", "")
     suggestions = []
     seen_titles = set(_recent_song_titles)
+    if current_title:
+        seen_titles.add(current_title.strip().lower())
+
     clean_artist = "" if not current_artist or current_artist == "Unknown" else current_artist.split(",")[0].strip()
 
-    # 1. JioSaavn artist / similar search
-    saavn_queries = [q for q in [clean_artist, f"{current_title} mix", "tamil hits"] if q]
-    for sq in saavn_queries:
-        for song in search_jiosaavn_songs(sq, limit=count + 3):
-            title = song["name"].strip()
-            artist = song["artist"]
-            if title and title.lower() not in seen_titles:
-                seen_titles.add(title.lower())
-                suggestions.append({
-                    "title": title,
-                    "artist": artist,
-                    "song_id": song.get("id", ""),
-                    "duration": song.get("duration", 0),
-                })
-                if len(suggestions) >= count:
-                    return suggestions
+    def add_if_tamil(parsed):
+        if not parsed:
+            return False
+        if parsed.get("language") != "tamil":
+            return False
+        title = (parsed.get("name") or "").strip()
+        if not title or title.lower() in seen_titles:
+            return False
+        # Skip short announcement teasers/skits when building music autoplay
+        if parsed.get("duration") and parsed["duration"] < 90:
+            return False
+        seen_titles.add(title.lower())
+        suggestions.append({
+            "title": title,
+            "artist": parsed.get("artist", "Unknown"),
+            "song_id": parsed.get("id", ""),
+            "album_id": parsed.get("album_id", ""),
+            "artist_id": parsed.get("artist_id", ""),
+            "duration": parsed.get("duration", 0),
+            "language": "tamil",
+        })
+        return len(suggestions) >= count
 
-    # 2. Audius full-track fallback suggestions
-    aud_query = clean_artist or current_title
-    for track in search_audius_songs(aud_query, limit=count + 2):
-        title = html.unescape(track.get("title") or "").strip()
-        artist = html.unescape((track.get("user") or {}).get("name") or "Unknown").strip()
-        if title and title.lower() not in seen_titles:
-            seen_titles.add(title.lower())
-            suggestions.append({
-                "title": title,
-                "artist": artist,
-                "duration": track.get("duration", 0),
-            })
-            if len(suggestions) >= count:
+    # 1. Related Tamil songs from the same movie/album
+    if album_id:
+        try:
+            r = requests.get(f"{JIOSAAVN_API_BASE}/api/albums", params={"id": album_id}, timeout=6)
+            if r.status_code == 200:
+                for s in (r.json().get("data") or {}).get("songs") or []:
+                    if add_if_tamil(_parse_sumit_song(s)):
+                        return suggestions
+        except Exception as e:
+            print(f"⚠️ Album related songs skipped: {e}")
+
+    # 2. Related Tamil songs from the same music director / singer
+    if artist_id:
+        try:
+            r = requests.get(f"{JIOSAAVN_API_BASE}/api/artists/{artist_id}/songs", params={"page": 0}, timeout=6)
+            if r.status_code == 200:
+                for s in (r.json().get("data") or {}).get("songs") or []:
+                    if add_if_tamil(_parse_sumit_song(s)):
+                        return suggestions
+        except Exception as e:
+            print(f"⚠️ Artist related songs skipped: {e}")
+
+    # 3. Search fallback strictly filtered to language == 'tamil'
+    tamil_queries = [q for q in [f"{clean_artist} tamil" if clean_artist else "", f"{current_title} tamil", "tamil hit songs"] if q]
+    for sq in tamil_queries:
+        for parsed in search_jiosaavn_songs(sq, limit=10, tamil_only=True):
+            if add_if_tamil(parsed):
                 return suggestions
 
     return suggestions
@@ -1117,30 +1195,31 @@ async def stream_music_task():
         await asyncio.sleep(0.02)
 
 async def prefetch_autoplay_songs():
-    """Pre-fetch autoplay song suggestions in background without blocking audio streaming."""
+    """Pre-fetch related Tamil-only autoplay song suggestions in background."""
     global last_song_metadata, music_queue
 
     try:
-        title = last_song_metadata.get('title', '')
-        artist = last_song_metadata.get('artist', '')
+        meta = dict(last_song_metadata or {})
+        title = meta.get('title', '')
+        artist = meta.get('artist', '')
         if title:
-            suggestions = await asyncio.to_thread(get_autoplay_suggestions, title, artist, 3)
+            suggestions = await asyncio.to_thread(get_autoplay_suggestions, title, artist, 3, meta)
             for s in suggestions:
                 await music_queue.put(s)
-            print(f"🎵 Pre-fetched {len(suggestions)} autoplay suggestions")
+            print(f"🎵 Pre-fetched {len(suggestions)} Tamil related autoplay suggestions")
     except Exception as e:
         print(f"⚠️ Autoplay prefetch failed: {e}")
 
 async def play_next_autoplay_song():
-    """Play the next song from autoplay queue"""
-    global current_song_query, is_music_playing, music_wf, last_song_metadata
+    """Play the next related Tamil song from autoplay queue"""
+    global current_song_query, is_music_playing, music_wf, last_song_metadata, _next_is_autoplay
 
     if music_queue.empty():
-        # No pre-fetched songs, get a new suggestion
         if last_song_metadata:
-            title = last_song_metadata.get('title', '')
-            artist = last_song_metadata.get('artist', '')
-            suggestions = await asyncio.to_thread(get_autoplay_suggestions, title, artist, 1)
+            meta = dict(last_song_metadata or {})
+            title = meta.get('title', '')
+            artist = meta.get('artist', '')
+            suggestions = await asyncio.to_thread(get_autoplay_suggestions, title, artist, 1, meta)
             if suggestions:
                 await music_queue.put(suggestions[0])
 
@@ -1148,8 +1227,9 @@ async def play_next_autoplay_song():
         next_song = await music_queue.get()
         artist = next_song.get('artist', '')
         artist_part = "" if not artist or artist == "Unknown" else f" {artist}"
+        _next_is_autoplay = True
         current_song_query = f"{next_song['title']}{artist_part}"
-        print(f"🔁 Autoplay: {next_song['title']} by {artist or 'Unknown'}")
+        print(f"🔁 Autoplay (Tamil): {next_song['title']} by {artist or 'Unknown'}")
         return True
     return False
 
@@ -1552,7 +1632,7 @@ async def ws_handler(websocket):
 async def main():
     global is_music_playing, current_song_query, music_wf, active_websocket
     global auto_play_next, last_song_title, proactive_nudge_reason, last_song_metadata
-    global autoplay_enabled, ai_is_speaking
+    global autoplay_enabled, ai_is_speaking, _next_is_autoplay
 
     init_memory()
     port = int(os.environ.get("PORT", 8000))
@@ -1600,11 +1680,14 @@ async def main():
                 if music_wf:
                     music_wf.close()
                     music_wf = None
-                drain_queue(music_queue)
+                is_autoplay = _next_is_autoplay
+                _next_is_autoplay = False
+                if not is_autoplay:
+                    drain_queue(music_queue)
                 query, current_song_query = current_song_query, None
                 update_esp32_screen("LOD")
 
-                result = await asyncio.to_thread(download_youtube_music_song, query)
+                result = await asyncio.to_thread(download_youtube_music_song, query, is_autoplay)
                 if result and result[0]:
                     is_music_playing = True
                     last_song_title = result[1]
