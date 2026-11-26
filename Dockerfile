@@ -15,10 +15,12 @@ COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
+# Install openwakeword >=0.6.0 without legacy tflite-runtime (uses onnxruntime on Linux Python 3.12+)
+RUN pip install --no-cache-dir --no-deps "openwakeword>=0.6.0"
 # Install latest yt-dlp with all features for YouTube Music
 RUN pip install --no-cache-dir -U --pre "yt-dlp[default]"
-# Pre-download openwakeword models as root before dropping to appuser
-RUN python -c "from openwakeword.utils import download_models; download_models(['hey_jarvis'])"
+# Pre-download and verify openwakeword ONNX models as root before dropping to appuser
+RUN python -c "from openwakeword.utils import download_models; from openwakeword.model import Model; download_models(['hey_jarvis']); Model(wakeword_models=['hey_jarvis'], inference_framework='onnx')"
 
 # Copy application code
 COPY *.py .
